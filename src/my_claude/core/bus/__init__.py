@@ -1,0 +1,1 @@
+"""Core bus protocol models."""
