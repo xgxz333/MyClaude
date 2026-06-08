@@ -1,0 +1,4 @@
+{"timestamp":"2026-06-08T04:58:04.379374+00:00","type":"run_started","message":"run started","data":{"goal":"用一句话介绍本项目"}}
+{"timestamp":"2026-06-08T04:58:04.379648+00:00","type":"llm_request_started","message":"llm request started","data":{"model_input_messages":1,"tools":0}}
+{"timestamp":"2026-06-08T04:58:10.429225+00:00","type":"llm_response_completed","message":"需要您提供项目的相关信息或描述，我才能帮您用一句话进行介绍。请问您的项目是关于什么的？","data":{"content":"需要您提供项目的相关信息或描述，我才能帮您用一句话进行介绍。请问您的项目是关于什么的？","has_raw_response":true}}
+{"timestamp":"2026-06-08T04:58:10.429475+00:00","type":"run_completed","message":"run completed","data":{"goal":"用一句话介绍本项目"}}

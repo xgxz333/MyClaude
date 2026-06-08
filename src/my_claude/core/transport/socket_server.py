@@ -1,3 +1,5 @@
+"""TCP transport for newline-delimited JSON-RPC requests."""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,12 +22,13 @@ from my_claude.core.bus.envelope import (
     to_ndjson,
 )
 
-
 RouteHandler = Callable[[JsonRpcRequest], Awaitable[BusResult]]
 JsonRpcReply = JsonRpcSuccessResponse | JsonRpcErrorResponse
 
 
 class TCPServer:
+    """Async TCP server that parses requests, dispatches routes, and writes JSON-RPC replies."""
+
     def __init__(
         self,
         host: str,

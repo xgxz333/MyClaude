@@ -1,0 +1,3 @@
+{"timestamp":"2026-06-08T05:19:34.956916+00:00","type":"run_started","message":"run started","data":{"goal":"用一句话介绍本项目，不要使用工具"}}
+{"timestamp":"2026-06-08T05:19:34.957149+00:00","type":"llm_request_started","message":"llm request started","data":{"model_input_messages":1,"tools":1}}
+{"timestamp":"2026-06-08T05:21:05.070145+00:00","type":"run_failed","message":"LLM request failed: <urlopen error timed out>","data":{"error":"LLM request failed: <urlopen error timed out>"}}

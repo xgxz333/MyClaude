@@ -1,0 +1,3 @@
+{"timestamp":"2026-06-08T04:49:22.936195+00:00","type":"run_started","message":"run started","data":{"goal":"用一句话回答：API 是否配置成功？"}}
+{"timestamp":"2026-06-08T04:49:22.936464+00:00","type":"llm_request_started","message":"llm request started","data":{"model_input_messages":1,"tools":0}}
+{"timestamp":"2026-06-08T04:49:52.975887+00:00","type":"run_failed","message":"LLM request failed: <urlopen error timed out>","data":{"error":"LLM request failed: <urlopen error timed out>"}}

@@ -1,0 +1,4 @@
+{"timestamp":"2026-06-08T04:52:52.090114+00:00","type":"run_started","message":"run started","data":{"goal":"用一句话回答：API 是否配置成功？"}}
+{"timestamp":"2026-06-08T04:52:52.090373+00:00","type":"llm_request_started","message":"llm request started","data":{"model_input_messages":1,"tools":0}}
+{"timestamp":"2026-06-08T04:52:58.941345+00:00","type":"llm_response_completed","message":"是的，您的消息我已收到并成功响应，**API 配置成功**。✅","data":{"content":"是的，您的消息我已收到并成功响应，**API 配置成功**。✅","has_raw_response":true}}
+{"timestamp":"2026-06-08T04:52:58.947566+00:00","type":"run_completed","message":"run completed","data":{"goal":"用一句话回答：API 是否配置成功？"}}

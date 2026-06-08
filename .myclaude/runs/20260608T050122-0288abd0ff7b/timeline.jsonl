@@ -1,0 +1,4 @@
+{"timestamp":"2026-06-08T05:01:22.165738+00:00","type":"run_started","message":"run started","data":{"goal":"用一句话介绍本项目"}}
+{"timestamp":"2026-06-08T05:01:22.165966+00:00","type":"llm_request_started","message":"llm request started","data":{"model_input_messages":1,"tools":1}}
+{"timestamp":"2026-06-08T05:01:22.166135+00:00","type":"llm_response_completed","message":"Local LLM placeholder accepted goal: 用一句话介绍本项目\nRegistered tools: 1","data":{"content":"Local LLM placeholder accepted goal: 用一句话介绍本项目\nRegistered tools: 1","has_raw_response":false}}
+{"timestamp":"2026-06-08T05:01:22.166273+00:00","type":"run_completed","message":"run completed","data":{"goal":"用一句话介绍本项目"}}

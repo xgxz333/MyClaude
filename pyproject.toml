@@ -9,6 +9,7 @@ description = "A staged agent reproduction project with IPC protocol contracts."
 readme = "READMME.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "anthropic>=0.105.2,<0.106",
     "pydantic>=2.0",
     "python-dotenv>=1.0",
 ]

@@ -1,3 +1,5 @@
+"""Logging configuration helpers for the core runtime."""
+
 from __future__ import annotations
 
 import json
@@ -8,11 +10,12 @@ from typing import Any
 
 from my_claude.core.config import AppConfig
 
-
 TEXT_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 class JsonLogFormatter(logging.Formatter):
+    """Format log records as compact JSON objects."""
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),

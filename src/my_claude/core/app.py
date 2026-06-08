@@ -1,3 +1,5 @@
+"""Core server entrypoint that starts the TCP IPC runtime."""
+
 from __future__ import annotations
 
 import argparse

@@ -1,16 +1,27 @@
+"""JSON-RPC envelope models and helpers for the S0 IPC protocol."""
+
 from __future__ import annotations
 
 import json
 from enum import IntEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, TypeAdapter, ValidationError
-
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    ValidationError,
+)
 
 JsonRpcId = StrictInt | StrictStr | None
 
 
 class JsonRpcErrorCode(IntEnum):
+    """Standard JSON-RPC error codes used by the core transport."""
+
     PARSE_ERROR = -32700
     INVALID_REQUEST = -32600
     METHOD_NOT_FOUND = -32601
@@ -20,6 +31,8 @@ class JsonRpcErrorCode(IntEnum):
 
 
 class JsonRpcError(BaseModel):
+    """Structured error object embedded in a JSON-RPC error response."""
+
     model_config = ConfigDict(extra="forbid")
 
     code: int
@@ -28,6 +41,8 @@ class JsonRpcError(BaseModel):
 
 
 class JsonRpcRequest(BaseModel):
+    """Incoming JSON-RPC request frame received from a client."""
+
     model_config = ConfigDict(extra="forbid")
 
     jsonrpc: Literal["2.0"] = "2.0"
@@ -37,6 +52,8 @@ class JsonRpcRequest(BaseModel):
 
 
 class JsonRpcSuccessResponse(BaseModel):
+    """JSON-RPC response frame for successful command execution."""
+
     model_config = ConfigDict(extra="forbid")
 
     jsonrpc: Literal["2.0"] = "2.0"
@@ -45,6 +62,8 @@ class JsonRpcSuccessResponse(BaseModel):
 
 
 class JsonRpcErrorResponse(BaseModel):
+    """JSON-RPC response frame for failed request parsing or execution."""
+
     model_config = ConfigDict(extra="forbid")
 
     jsonrpc: Literal["2.0"] = "2.0"
@@ -53,7 +72,7 @@ class JsonRpcErrorResponse(BaseModel):
 
 
 JsonRpcResponse = JsonRpcSuccessResponse | JsonRpcErrorResponse
-JsonRpcResponseAdapter = TypeAdapter(JsonRpcResponse)
+JsonRpcResponseAdapter: TypeAdapter[JsonRpcResponse] = TypeAdapter(JsonRpcResponse)
 
 
 def parse_request(raw: bytes | str) -> JsonRpcRequest:
@@ -74,7 +93,11 @@ def make_error_response(
     message: str | None = None,
     data: Any | None = None,
 ) -> JsonRpcErrorResponse:
-    error = JsonRpcError(code=code.value, message=message or _default_error_message(code), data=data)
+    error = JsonRpcError(
+        code=code.value,
+        message=message or _default_error_message(code),
+        data=data,
+    )
     return JsonRpcErrorResponse(id=request_id, error=error)
 
 
@@ -88,29 +111,35 @@ def _loads_json_object(raw: bytes | str) -> dict[str, Any]:
     except json.JSONDecodeError as error:
         raise ValidationError.from_exception_data(
             "JsonRpcEnvelope",
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("json",),
-                    "msg": "Invalid JSON",
-                    "input": raw,
-                    "ctx": {"error": error},
-                }
-            ],
+            cast(
+                Any,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("json",),
+                        "msg": "Invalid JSON",
+                        "input": raw,
+                        "ctx": {"error": error},
+                    }
+                ],
+            ),
         ) from error
 
     if not isinstance(value, dict):
         raise ValidationError.from_exception_data(
             "JsonRpcEnvelope",
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("json",),
-                    "msg": "JSON-RPC envelope must be an object",
-                    "input": value,
-                    "ctx": {"error": ValueError("JSON-RPC envelope must be an object")},
-                }
-            ],
+            cast(
+                Any,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("json",),
+                        "msg": "JSON-RPC envelope must be an object",
+                        "input": value,
+                        "ctx": {"error": ValueError("JSON-RPC envelope must be an object")},
+                    }
+                ],
+            ),
         )
 
     return value

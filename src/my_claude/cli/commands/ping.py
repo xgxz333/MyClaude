@@ -1,3 +1,5 @@
+"""Implementation of the `myclaude ping` health-check command."""
+
 from __future__ import annotations
 
 import argparse

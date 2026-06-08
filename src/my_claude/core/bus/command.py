@@ -1,3 +1,5 @@
+"""Typed command and result models accepted by the S0 core bus."""
+
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
@@ -7,17 +9,20 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from my_claude.core.bus.envelope import JsonRpcRequest
 
-
-CORE_PING_METHOD = "core.ping"
+CORE_PING_METHOD: Literal["core.ping"] = "core.ping"
 PACKAGE_NAME = "MyClaude"
 FALLBACK_VERSION = "0.1.0"
 
 
 class CorePingParams(BaseModel):
+    """Parameters for the `core.ping` command."""
+
     model_config = ConfigDict(extra="forbid")
 
 
 class CorePingCommand(BaseModel):
+    """Command envelope for checking whether the core server is alive."""
+
     model_config = ConfigDict(extra="forbid")
 
     method: Literal["core.ping"] = CORE_PING_METHOD
@@ -25,6 +30,8 @@ class CorePingCommand(BaseModel):
 
 
 class CorePingResult(BaseModel):
+    """Result returned by the core server after a successful ping."""
+
     model_config = ConfigDict(extra="forbid")
 
     pong: Literal["pong"] = "pong"
