@@ -12,7 +12,13 @@ from pathlib import Path
 
 from my_claude.agent.agent import Agent, AgentResult
 from my_claude.agent.control import LoopController
-from my_claude.agent.events import AgentEvent, EventHandler, RunCancelledEvent
+from my_claude.agent.events import (
+    AgentEvent,
+    EventHandler,
+    RunCancelledEvent,
+    RunFailedEvent,
+    RunStartedEvent,
+)
 from my_claude.agent.memory import RunStatus, WorkingMemory
 from my_claude.agent.tools import ToolRegistry
 from my_claude.core.config import AppConfig
@@ -31,11 +37,11 @@ class RunContext:
     run_id: str
     run_dir: Path
     timeline_path: Path
+    config: AppConfig
     event_bus: EventBus[AgentEvent]
     working_memory: WorkingMemory
     tools: ToolRegistry
     loop_controller: LoopController
-    agent: Agent
 
 
 @dataclass(frozen=True)
@@ -54,12 +60,34 @@ async def run_goal(
     config: AppConfig,
     listeners: Sequence[EventHandler] = (),
 ) -> RunResult:
-    context = prepare_run_context(goal, config=config, listeners=listeners)
+    context = prepare_run_context(goal, config=config)
+    return await run_prepared_context(context, listeners=listeners)
 
+
+async def run_prepared_context(
+    context: RunContext,
+    *,
+    listeners: Sequence[EventHandler] = (),
+) -> RunResult:
+    """Run a prepared context after attaching durable and live event subscribers."""
     with JsonlEventWriter(context.timeline_path) as timeline_writer:
         context.event_bus.subscribe(timeline_writer.handle)
+        for listener in listeners:
+            context.event_bus.subscribe(listener)
+
         try:
-            agent_result = await context.agent.run()
+            await context.event_bus.publish(
+                RunStartedEvent(
+                    goal=context.working_memory.goal,
+                    run_id=context.run_id,
+                )
+            )
+            try:
+                agent = _create_agent(context)
+            except Exception as error:
+                await _handle_run_failure(context, error)
+                raise
+            agent_result = await agent.run(emit_run_started=False)
         except asyncio.CancelledError:
             await _handle_run_interruption(context)
             raise
@@ -86,7 +114,6 @@ def prepare_run_context(
     for listener in listeners:
         event_bus.subscribe(listener)
 
-    llm_client = create_llm_client(config)
     tools = ToolRegistry([ReadFileTool(root=Path.cwd())])
     loop_controller = LoopController(max_iterations=config.agent_max_iterations)
     working_memory = WorkingMemory.from_goal(
@@ -94,24 +121,31 @@ def prepare_run_context(
         run_id=run_id,
         max_steps=config.agent_max_iterations,
     )
-    timeline_path = run_dir / "timeline.jsonl"
-    agent = Agent(
-        llm_client=llm_client,
-        tools=tools,
-        working_memory=working_memory,
-        loop_controller=loop_controller,
-        event_handler=event_bus.publish,
-    )
-
+    timeline_path = run_dir / "events.jsonl"
     return RunContext(
         run_id=run_id,
         run_dir=run_dir,
         timeline_path=timeline_path,
+        config=config,
         event_bus=event_bus,
         working_memory=working_memory,
         tools=tools,
         loop_controller=loop_controller,
-        agent=agent,
+    )
+
+
+def _create_agent(context: RunContext) -> Agent:
+    llm_client = create_llm_client(
+        context.config,
+        event_handler=context.event_bus.publish,
+        run_id=context.run_id,
+    )
+    return Agent(
+        llm_client=llm_client,
+        tools=context.tools,
+        working_memory=context.working_memory,
+        loop_controller=context.loop_controller,
+        event_handler=context.event_bus.publish,
     )
 
 
@@ -133,6 +167,22 @@ async def _handle_run_interruption(context: RunContext) -> None:
     )
 
 
+async def _handle_run_failure(context: RunContext, error: Exception) -> None:
+    if context.working_memory.status != RunStatus.FAILED:
+        context.working_memory.set_status(
+            RunStatus.FAILED,
+            reason=str(error),
+            transition_reason="runner failed before agent loop started",
+        )
+    await context.event_bus.publish(
+        RunFailedEvent(
+            message=str(error),
+            error=str(error),
+            run_id=context.run_id,
+        )
+    )
+
+
 def new_run_id() -> str:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    return f"{timestamp}-{uuid.uuid4().hex[:12]}"
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    return f"{timestamp}-{uuid.uuid4().hex[:6]}"

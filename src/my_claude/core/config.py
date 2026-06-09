@@ -26,14 +26,14 @@ class AppConfig(BaseModel):
     debug: bool = False
     ipc_timeout_seconds: float = Field(default=5.0, gt=0)
     core_host: str = "127.0.0.1"
-    core_port: int = Field(default=8765, gt=0, le=65535)
+    core_port: int = Field(default=7437, gt=0, le=65535)
     max_request_bytes: int = Field(default=65536, gt=0)
-    runs_dir: Path = Path(".myclaude/runs")
-    agent_max_iterations: int = Field(default=1, gt=0)
+    runs_dir: Path = Path("runs")
+    agent_max_iterations: int = Field(default=20, gt=0)
     llm_provider: Literal["local", "openai-compatible", "anthropic"] = "local"
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1/responses"
-    llm_model: str = "local-echo"
+    llm_model: str = "claude-sonnet-4-6"
     llm_timeout_seconds: float = Field(default=30.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
 

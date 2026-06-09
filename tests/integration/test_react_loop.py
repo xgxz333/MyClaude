@@ -81,14 +81,19 @@ def test_react_loop_observes_tool_calls_acts_then_terminates() -> None:
     ]
     assert memory.messages[2].content[0].type == "tool_result"
     assert [event.type for event in events] == [
+        AgentEventType.STEP_STARTED,
         AgentEventType.LLM_REQUEST_STARTED,
         AgentEventType.LLM_RESPONSE_COMPLETED,
         AgentEventType.TOOL_CALL_STARTED,
         AgentEventType.TOOL_CALL_COMPLETED,
+        AgentEventType.STEP_FINISHED,
+        AgentEventType.STEP_STARTED,
         AgentEventType.LLM_REQUEST_STARTED,
         AgentEventType.LLM_RESPONSE_COMPLETED,
+        AgentEventType.STEP_FINISHED,
         AgentEventType.RUN_COMPLETED,
     ]
+    assert events[0].data == {"run_id": "run-1", "step": 1}
 
 
 def test_react_loop_marks_memory_cancelled_when_external_cancel_is_requested() -> None:

@@ -13,8 +13,12 @@ class AgentEventType(StrEnum):
     """Known lifecycle event names emitted during an agent run."""
 
     RUN_STARTED = "run_started"
+    STEP_STARTED = "step_started"
+    STEP_FINISHED = "step_finished"
     LLM_REQUEST_STARTED = "llm_request_started"
     LLM_TOKEN = "llm_token"
+    LLM_USAGE = "llm_usage"
+    LLM_MODEL_SELECTED = "llm_model_selected"
     LLM_RESPONSE_COMPLETED = "llm_response_completed"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_CALL_COMPLETED = "tool_call_completed"
@@ -46,6 +50,25 @@ class RunStartedEvent(AgentEvent):
     type: Literal[AgentEventType.RUN_STARTED] = AgentEventType.RUN_STARTED
     message: str = "run started"
     goal: str
+    run_id: str | None = None
+
+
+class StepStartedEvent(AgentEvent):
+    """Event emitted when one ReAct loop step begins."""
+
+    type: Literal[AgentEventType.STEP_STARTED] = AgentEventType.STEP_STARTED
+    message: str = "step started"
+    run_id: str
+    step: int
+
+
+class StepFinishedEvent(AgentEvent):
+    """Event emitted when one ReAct loop step finishes."""
+
+    type: Literal[AgentEventType.STEP_FINISHED] = AgentEventType.STEP_FINISHED
+    message: str = "step finished"
+    run_id: str
+    step: int
 
 
 class LLMRequestStartedEvent(AgentEvent):
@@ -64,6 +87,29 @@ class LLMTokenEvent(AgentEvent):
     message: str = "llm token"
     token: str
     index: int | None = None
+    run_id: str | None = None
+
+
+class LLMUsageEvent(AgentEvent):
+    """Event emitted after the LLM stream reports usage statistics."""
+
+    type: Literal[AgentEventType.LLM_USAGE] = AgentEventType.LLM_USAGE
+    message: str = "llm usage"
+    run_id: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+
+
+class LLMModelSelectedEvent(AgentEvent):
+    """Event emitted when the static model is selected for a request."""
+
+    type: Literal[AgentEventType.LLM_MODEL_SELECTED] = AgentEventType.LLM_MODEL_SELECTED
+    message: str = "llm model selected"
+    run_id: str
+    model: str
+    strategy: str = "static"
 
 
 class LLMResponseCompletedEvent(AgentEvent):
@@ -79,6 +125,7 @@ class ToolCallStartedEvent(AgentEvent):
 
     type: Literal[AgentEventType.TOOL_CALL_STARTED] = AgentEventType.TOOL_CALL_STARTED
     message: str = "tool call started"
+    run_id: str | None = None
     tool_use_id: str
     tool_name: str
     arguments: Mapping[str, Any]
@@ -89,10 +136,13 @@ class ToolCallCompletedEvent(AgentEvent):
 
     type: Literal[AgentEventType.TOOL_CALL_COMPLETED] = AgentEventType.TOOL_CALL_COMPLETED
     message: str = "tool call completed"
+    run_id: str | None = None
     tool_use_id: str | None = None
     tool_name: str
     result: str | None = None
     error: str | None = None
+    error_type: str | None = None
+    elapsed_ms: int | None = None
 
 
 class RunCompletedEvent(AgentEvent):
@@ -101,6 +151,7 @@ class RunCompletedEvent(AgentEvent):
     type: Literal[AgentEventType.RUN_COMPLETED] = AgentEventType.RUN_COMPLETED
     message: str = "run completed"
     goal: str
+    run_id: str | None = None
 
 
 class RunCancelledEvent(AgentEvent):
@@ -108,6 +159,7 @@ class RunCancelledEvent(AgentEvent):
 
     type: Literal[AgentEventType.RUN_CANCELLED] = AgentEventType.RUN_CANCELLED
     message: str = "run cancelled"
+    run_id: str | None = None
     reason: str | None = None
 
 
@@ -117,12 +169,17 @@ class RunFailedEvent(AgentEvent):
     type: Literal[AgentEventType.RUN_FAILED] = AgentEventType.RUN_FAILED
     message: str = "run failed"
     error: str
+    run_id: str | None = None
 
 
 KnownAgentEvent = (
     RunStartedEvent
+    | StepStartedEvent
+    | StepFinishedEvent
     | LLMRequestStartedEvent
     | LLMTokenEvent
+    | LLMUsageEvent
+    | LLMModelSelectedEvent
     | LLMResponseCompletedEvent
     | ToolCallStartedEvent
     | ToolCallCompletedEvent
