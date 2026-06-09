@@ -37,12 +37,13 @@ def register_routes(
     config: AppConfig | None = None,
     started_at: float | None = None,
     server_version: str | None = None,
+    run_tasks: set[asyncio.Task[RunResult]] | None = None,
 ) -> None:
     start_time = started_at if started_at is not None else time.perf_counter()
     version = server_version or get_server_version()
     runtime_config = config or AppConfig()
     event_broadcaster = IpcEventBroadcaster(runtime_config.runs_dir)
-    run_tasks: set[asyncio.Task[RunResult]] = set()
+    active_run_tasks: set[asyncio.Task[RunResult]] = run_tasks if run_tasks is not None else set()
 
     async def handle_core_ping(_request: JsonRpcRequest) -> BusResult:
         return ping_result(
@@ -56,26 +57,35 @@ def register_routes(
             raise ValueError("event.subscribe params are invalid")
 
         connection = current_tcp_connection()
-        await event_broadcaster.replay(
+        replayed_count = await event_broadcaster.replay(
             connection,
             replay_from=command.params.replay_from,
+            replay_from_run=command.params.replay_from_run,
+            topics=command.params.topics,
+            scope=command.params.scope,
             event_types=command.params.event_types,
             run_id=command.params.run_id,
         )
         subscription_id = event_broadcaster.subscribe(
             connection,
+            topics=command.params.topics,
+            scope=command.params.scope,
             event_types=command.params.event_types,
             run_id=command.params.run_id,
         )
         return EventSubscribeResult(
             subscription_id=subscription_id,
             next_sequence=event_broadcaster.next_sequence,
+            replayed_count=replayed_count,
         )
 
     async def handle_agent_run(request: JsonRpcRequest) -> BusResult:
         command = command_from_request(request)
         if not isinstance(command, AgentRunCommand):
             raise ValueError("agent.run params are invalid")
+
+        if any(not task.done() for task in active_run_tasks):
+            raise RuntimeError("a run is already in progress")
 
         context = prepare_run_context(command.params.goal, config=runtime_config)
         run_task = asyncio.create_task(
@@ -84,8 +94,10 @@ def register_routes(
                 listeners=[event_broadcaster.handle],
             )
         )
-        run_tasks.add(run_task)
-        run_task.add_done_callback(lambda task: _finish_background_run(task, run_tasks))
+        active_run_tasks.add(run_task)
+        run_task.add_done_callback(
+            lambda task: _finish_background_run(task, active_run_tasks)
+        )
         return AgentRunResult(
             run_id=context.run_id,
             goal=context.working_memory.goal,
@@ -111,6 +123,35 @@ def _finish_background_run(
         logger.exception("background agent run failed")
 
 
+async def _cancel_background_runs(
+    run_tasks: set[asyncio.Task[RunResult]],
+    *,
+    timeout_seconds: float = 2.0,
+) -> None:
+    active_tasks = {task for task in run_tasks if not task.done()}
+    if not active_tasks:
+        return
+
+    logger.info("cancelling %d background run task(s)", len(active_tasks))
+    for task in active_tasks:
+        task.cancel()
+
+    done, pending = await asyncio.wait(active_tasks, timeout=timeout_seconds)
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            task.result()
+        except Exception:
+            logger.exception("background agent run failed during shutdown")
+
+    if pending:
+        logger.warning(
+            "core shutdown left %d background run task(s) pending",
+            len(pending),
+        )
+
+
 async def _run_async() -> None:
     started_at = time.perf_counter()
     config = load_config()
@@ -121,7 +162,8 @@ async def _run_async() -> None:
         config.core_port,
         max_request_bytes=config.max_request_bytes,
     )
-    register_routes(server, config=config, started_at=started_at)
+    run_tasks: set[asyncio.Task[RunResult]] = set()
+    register_routes(server, config=config, started_at=started_at, run_tasks=run_tasks)
 
     logger = logging.getLogger(__name__)
     logger.info("core routes registered: %s", ", ".join(server.routes))
@@ -134,7 +176,10 @@ async def _run_async() -> None:
         except NotImplementedError:
             pass
 
-    await server.serve_until_stopped(shutdown_event)
+    try:
+        await server.serve_until_stopped(shutdown_event)
+    finally:
+        await _cancel_background_runs(run_tasks)
 
 
 def run(argv: list[str] | None = None) -> int:

@@ -289,12 +289,12 @@ def test_runner_writes_timeline_file(tmp_path: Path) -> None:
     assert result.run_dir.exists()
     assert result.agent_result.goal == "ship it"
     assert [event["type"] for event in events] == [
-        "run_started",
-        "step_started",
-        "llm_request_started",
-        "llm_response_completed",
-        "step_finished",
-        "run_completed",
+        "run.started",
+        "step.started",
+        "llm.request_started",
+        "llm.response_completed",
+        "step.finished",
+        "run.finished",
     ]
     assert events[0]["data"]["goal"] == "ship it"
     assert events[1]["data"]["step"] == 1
@@ -395,7 +395,7 @@ def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
     with timeline_path.open("a", encoding="utf-8") as file:
         file.write("")
 
-    assert events[-1]["type"] == "run_cancelled"
+    assert events[-1]["type"] == "run.cancelled"
     assert "async cancellation requested" in events[-1]["data"]["reason"]
     assert "run cancelled" in caplog.text
 
@@ -564,7 +564,7 @@ def test_llm_token_event_is_a_pydantic_event_model() -> None:
     assert event.type == AgentEventType.LLM_TOKEN
     assert event.data == {"token": "hello", "index": 1}
     assert event.model_dump(mode="json") == {
-        "type": "llm_token",
+        "type": "llm.token",
         "message": "llm token",
         "token": "hello",
         "index": 1,

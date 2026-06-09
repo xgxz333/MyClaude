@@ -51,6 +51,9 @@ class EventSubscribeParams(BaseModel):
     replay_from: int | None = Field(default=None, ge=1)
     event_types: list[AgentEventType] | None = None
     run_id: str | None = Field(default=None, min_length=1)
+    topics: list[str] = Field(default_factory=lambda: ["*"])
+    scope: str = "global"
+    replay_from_run: str | None = Field(default=None, min_length=1)
 
 
 class EventSubscribeCommand(BaseModel):
@@ -69,6 +72,7 @@ class EventSubscribeResult(BaseModel):
 
     subscription_id: str
     next_sequence: int
+    replayed_count: int = 0
 
 
 class AgentRunParams(BaseModel):

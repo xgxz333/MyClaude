@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from my_claude.core.bus.envelope import (
+    EventPushEnvelope,
     JsonRpcErrorCode,
     make_error_response,
     make_notification,
@@ -32,6 +33,7 @@ async def _dispatch_mixed_stream_frames() -> tuple[list[tuple[str, int]], Any]:
     response_future: asyncio.Future[Any] = loop.create_future()
     pending = {1: response_future}
     calls: list[tuple[str, int]] = []
+    events: list[str] = []
 
     async def first_handler(params: dict[str, Any]) -> None:
         calls.append(("first", int(params["sequence"])))
@@ -43,6 +45,7 @@ async def _dispatch_mixed_stream_frames() -> tuple[list[tuple[str, int]], Any]:
     dispatcher = SocketFrameDispatcher(
         pending,
         {"event.publish": [first_handler, second_handler]},
+        [lambda event: _record_event(event, events)],
     )
 
     await dispatcher.dispatch_line(
@@ -54,7 +57,11 @@ async def _dispatch_mixed_stream_frames() -> tuple[list[tuple[str, int]], Any]:
     await dispatcher.dispatch_line(
         to_ndjson(make_notification("event.publish", {"sequence": 2}))
     )
+    await dispatcher.dispatch_line(
+        to_ndjson(EventPushEnvelope(event={"type": "run.started", "run_id": "run-1"}))
+    )
 
+    assert events == ["run.started"]
     return calls, await response_future
 
 
@@ -62,7 +69,7 @@ def test_socket_frame_dispatcher_sets_jsonrpc_error_on_pending_request() -> None
     async def dispatch_error() -> None:
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[Any] = loop.create_future()
-        dispatcher = SocketFrameDispatcher({1: response_future}, {})
+        dispatcher = SocketFrameDispatcher({1: response_future}, {}, [])
 
         await dispatcher.dispatch_line(
             to_ndjson(
@@ -79,3 +86,9 @@ def test_socket_frame_dispatcher_sets_jsonrpc_error_on_pending_request() -> None
             await response_future
 
     asyncio.run(dispatch_error())
+
+
+async def _record_event(event: dict[str, Any], events: list[str]) -> None:
+    event_type = event.get("type")
+    if isinstance(event_type, str):
+        events.append(event_type)

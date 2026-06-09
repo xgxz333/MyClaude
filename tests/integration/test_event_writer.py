@@ -45,7 +45,7 @@ def test_jsonl_event_writer_writes_json_line_and_flushes_per_event(tmp_path: Pat
     assert event_file.values[0].endswith("\n")
 
     payload = json.loads(event_file.values[0])
-    assert payload["type"] == "tool_call_completed"
+    assert payload["type"] == "tool.call_finished"
     assert payload["message"] == "tool call completed"
     assert payload["data"] == {"tool_use_id": "tool-1", "tool_name": "example", "result": "ok"}
 
@@ -58,7 +58,7 @@ def test_jsonl_event_writer_context_opens_and_closes_file(tmp_path: Path) -> Non
         asyncio.run(writer.handle(event))
 
     payload = json.loads(path.read_text(encoding="utf-8").strip())
-    assert payload["type"] == "run_started"
+    assert payload["type"] == "run.started"
 
 
 def test_serialize_event_redacts_secrets_from_tool_results() -> None:

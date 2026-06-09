@@ -15,7 +15,6 @@ from typing import Any, TextIO
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
 from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
-    EVENT_PUBLISH_METHOD,
     EVENT_SUBSCRIBE_METHOD,
 )
 from my_claude.core.config import AppConfig, load_config
@@ -145,12 +144,8 @@ async def _run_over_socket(goal: str, *, config: AppConfig, printer: StdoutPrint
     terminal_event = asyncio.Event()
     terminal_exit_code = 0
 
-    async def handle_event(params: dict[str, Any]) -> None:
+    async def handle_event(event_payload: dict[str, Any]) -> None:
         nonlocal terminal_exit_code
-
-        event_payload = params.get("event")
-        if not isinstance(event_payload, dict):
-            raise SocketClientError("event.publish params must include an event object")
 
         event = KnownAgentEventAdapter.validate_python(event_payload)
         await printer.handle(event)
@@ -171,10 +166,23 @@ async def _run_over_socket(goal: str, *, config: AppConfig, printer: StdoutPrint
         timeout_seconds=config.ipc_timeout_seconds,
         max_response_bytes=config.max_request_bytes,
     ) as client:
-        client.on(EVENT_PUBLISH_METHOD, handle_event)
+        client.on_event(handle_event)
 
         # Subscribe before triggering the daemon-side agent run so no lifecycle event is lost.
-        await client.request(EVENT_SUBSCRIBE_METHOD, {})
+        await client.request(
+            EVENT_SUBSCRIBE_METHOD,
+            {
+                "topics": [
+                    "run.*",
+                    "step.*",
+                    "tool.*",
+                    "llm.token",
+                    "llm.usage",
+                    "llm.response_completed",
+                ],
+                "scope": "global",
+            },
+        )
 
         try:
             await client.request(AGENT_RUN_METHOD, {"goal": goal})

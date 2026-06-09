@@ -14,7 +14,6 @@ from textual.widgets import Button, Footer, Header, Input, Log, Static
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
 from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
-    EVENT_PUBLISH_METHOD,
     EVENT_SUBSCRIBE_METHOD,
 )
 from my_claude.core.config import AppConfig, load_config
@@ -65,6 +64,8 @@ class MyClaudeTui(App[None]):
         self._connected = asyncio.Event()
         self._log_buffer: list[str] = []
         self._log_flush_timer: Timer | None = None
+        self._token_buffer = ""
+        self._response_had_tokens = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -137,9 +138,23 @@ class MyClaudeTui(App[None]):
                     max_response_bytes=self._config.max_request_bytes,
                 )
                 await client.connect()
-                client.on(EVENT_PUBLISH_METHOD, self._handle_event_notification)
+                client.on_event(self._handle_event)
 
-                await client.request(EVENT_SUBSCRIBE_METHOD, {})
+                await client.request(
+                    EVENT_SUBSCRIBE_METHOD,
+                    {
+                        "topics": [
+                            "run.*",
+                            "step.*",
+                            "tool.*",
+                            "llm.token",
+                            "llm.usage",
+                            "llm.response_completed",
+                            "log.*",
+                        ],
+                        "scope": "global",
+                    },
+                )
 
                 self._client = client
                 self._connected.set()
@@ -158,6 +173,7 @@ class MyClaudeTui(App[None]):
                 await asyncio.sleep(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, 5.0)
             finally:
+                self._flush_tokens()
                 self._flush_log_buffer()
                 if client is not None:
                     with suppress(Exception):
@@ -167,19 +183,42 @@ class MyClaudeTui(App[None]):
                 self._connected.clear()
                 self._set_status("disconnected")
 
-    async def _handle_event_notification(self, params: dict[str, Any]) -> None:
-        event_payload = params.get("event")
-        if not isinstance(event_payload, dict):
-            raise SocketClientError("event.publish params must include an event object")
-
+    async def _handle_event(self, event_payload: dict[str, Any]) -> None:
         event = KnownAgentEventAdapter.validate_python(event_payload)
-        self._write_log(_format_event(event))
+        self._write_event(event)
 
     def _set_status(self, value: str) -> None:
         self.query_one("#status", Static).update(value)
 
     def _write_log(self, line: str) -> None:
         self._log_buffer.append(line)
+
+    def _write_event(self, event: AgentEvent) -> None:
+        if event.type == AgentEventType.LLM_TOKEN:
+            self._token_buffer += str(event.data.get("token", ""))
+            self._response_had_tokens = True
+            return
+
+        if event.type == AgentEventType.LLM_RESPONSE_COMPLETED:
+            if self._response_had_tokens:
+                self._flush_tokens()
+                return
+
+            self._write_log(str(event.data.get("content") or event.message))
+            return
+
+        self._flush_tokens()
+        if event.type in {AgentEventType.RUN_STARTED, AgentEventType.LLM_REQUEST_STARTED}:
+            self._response_had_tokens = False
+
+        self._write_log(_format_event(event))
+
+    def _flush_tokens(self) -> None:
+        if not self._token_buffer:
+            return
+
+        self._write_log(self._token_buffer)
+        self._token_buffer = ""
 
     def _flush_log_buffer(self) -> None:
         if not self._log_buffer:

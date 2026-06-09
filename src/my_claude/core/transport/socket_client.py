@@ -9,17 +9,19 @@ from contextlib import suppress
 from typing import Any
 
 from my_claude.core.bus.envelope import (
+    EventPushEnvelope,
     JsonRpcErrorResponse,
     JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcResponse,
+    JsonRpcResponseAdapter,
     JsonRpcSuccessResponse,
     parse_notification,
-    parse_response,
     to_ndjson,
 )
 
 NotificationHandler = Callable[[dict[str, Any]], Awaitable[None]]
+EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class SocketClientError(RuntimeError):
@@ -33,9 +35,11 @@ class SocketFrameDispatcher:
         self,
         pending: dict[int, asyncio.Future[Any]],
         notification_handlers: dict[str, list[NotificationHandler]],
+        event_handlers: list[EventHandler],
     ) -> None:
         self._pending = pending
         self._notification_handlers = notification_handlers
+        self._event_handlers = event_handlers
 
     async def dispatch_line(self, line: bytes) -> None:
         frame = self._deserialize(line)
@@ -43,9 +47,16 @@ class SocketFrameDispatcher:
             self._dispatch_response(frame)
             return
 
+        if isinstance(frame, EventPushEnvelope):
+            await self._dispatch_event(frame)
+            return
+
         await self._dispatch_notification(frame)
 
-    def _deserialize(self, line: bytes) -> JsonRpcResponse | JsonRpcNotification:
+    def _deserialize(
+        self,
+        line: bytes,
+    ) -> JsonRpcResponse | JsonRpcNotification | EventPushEnvelope:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as error:
@@ -54,13 +65,16 @@ class SocketFrameDispatcher:
         if not isinstance(payload, dict):
             raise SocketClientError("JSON-RPC frame must be an object")
 
-        if "id" in payload:
-            return parse_response(line)
+        if payload.get("kind") == "event":
+            return EventPushEnvelope.model_validate(payload)
+
+        if payload.get("jsonrpc") == "2.0" and "id" in payload:
+            return JsonRpcResponseAdapter.validate_python(payload)
 
         if "method" in payload:
             return parse_notification(line)
 
-        raise SocketClientError("JSON-RPC frame must be a response or notification")
+        raise SocketClientError("socket frame must be a response, notification, or event")
 
     def _dispatch_response(self, response: JsonRpcResponse) -> None:
         if not isinstance(response.id, int):
@@ -86,6 +100,10 @@ class SocketFrameDispatcher:
         for handler in handlers:
             await handler(notification.params)
 
+    async def _dispatch_event(self, envelope: EventPushEnvelope) -> None:
+        for handler in tuple(self._event_handlers):
+            await handler(envelope.event)
+
 
 class SocketClient:
     """Maintain one TCP JSON-RPC connection and dispatch pushed notifications."""
@@ -108,7 +126,12 @@ class SocketClient:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._notification_handlers: dict[str, list[NotificationHandler]] = {}
-        self._dispatcher = SocketFrameDispatcher(self._pending, self._notification_handlers)
+        self._event_handlers: list[EventHandler] = []
+        self._dispatcher = SocketFrameDispatcher(
+            self._pending,
+            self._notification_handlers,
+            self._event_handlers,
+        )
         self._closed = False
 
     async def __aenter__(self) -> SocketClient:
@@ -143,6 +166,16 @@ class SocketClient:
 
     def on(self, method: str, handler: NotificationHandler) -> None:
         self._notification_handlers.setdefault(method, []).append(handler)
+
+    def on_event(self, handler: EventHandler) -> None:
+        self._event_handlers.append(handler)
+
+    async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        result = await self.request(method, params)
+        return result if isinstance(result, dict) else {}
+
+    async def run_event_loop(self) -> None:
+        await self.wait_closed()
 
     async def request(
         self,

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from my_claude.core.bus.command import BusResult, command_from_request, result_to_json
 from my_claude.core.bus.envelope import (
+    EventPushEnvelope,
     JsonRpcErrorCode,
     JsonRpcErrorResponse,
     JsonRpcId,
@@ -63,6 +64,15 @@ class TCPConnection:
                 self._writer.write(to_ndjson(notification))
             await self._writer.drain()
 
+    async def write_event(self, event: EventPushEnvelope) -> None:
+        await self.write_events([event])
+
+    async def write_events(self, events: list[EventPushEnvelope]) -> None:
+        async with self._write_lock:
+            for event in events:
+                self._writer.write(to_ndjson(event))
+            await self._writer.drain()
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -76,7 +86,7 @@ class TCPConnection:
 
         self._writer.close()
         with suppress(Exception):
-            await self._writer.wait_closed()
+            await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
 
 
 def current_tcp_connection() -> TCPConnection:
@@ -111,6 +121,17 @@ class TCPServer:
         self.routes[method] = handler
 
     async def start(self) -> None:
+        if self.port != 0:
+            try:
+                _reader, writer = await asyncio.open_connection(self.host, self.port)
+            except OSError:
+                pass
+            else:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                raise SystemExit(f"core already running at {self.host}:{self.port}")
+
         self._server = await asyncio.start_server(
             self._handle_client,
             self.host,
@@ -132,13 +153,24 @@ class TCPServer:
     async def shutdown(self) -> None:
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
             self._server = None
 
         if self._connection_tasks:
             for task in self._connection_tasks:
                 task.cancel()
-            await asyncio.gather(*self._connection_tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(self._connection_tasks, timeout=2.0)
+            for task in done:
+                if task.cancelled():
+                    continue
+                with suppress(Exception):
+                    task.result()
+            if pending:
+                self.logger.warning(
+                    "tcp server shutdown left %d connection task(s) pending",
+                    len(pending),
+                )
             self._connection_tasks.clear()
 
         self.logger.info("tcp server stopped")

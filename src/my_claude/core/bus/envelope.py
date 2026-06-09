@@ -61,6 +61,15 @@ class JsonRpcNotification(BaseModel):
     params: dict[str, Any] | list[Any] | None = None
 
 
+class EventPushEnvelope(BaseModel):
+    """Server-pushed event frame compatible with the Kama S2 IPC stream."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["event"] = "event"
+    event: dict[str, Any]
+
+
 class JsonRpcSuccessResponse(BaseModel):
     """JSON-RPC response frame for successful command execution."""
 

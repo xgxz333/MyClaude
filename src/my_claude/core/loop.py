@@ -105,6 +105,7 @@ class AgentLoop:
                     RunCompletedEvent(
                         goal=self._working_memory.goal,
                         run_id=self._working_memory.run_id,
+                        steps=self._working_memory.step,
                     )
                 )
                 return AgentLoopResult(final_response=last_response)

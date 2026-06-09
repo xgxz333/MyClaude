@@ -12,19 +12,18 @@ from my_claude.agent.events import (
     RunStartedEvent,
     StepStartedEvent,
 )
-from my_claude.core.bus.command import EVENT_PUBLISH_METHOD
-from my_claude.core.bus.envelope import JsonRpcNotification
+from my_claude.core.bus.envelope import EventPushEnvelope
 from my_claude.core.events.writer import serialize_event
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster, IpcEventConnection
 
 
 class RecordingConnection:
     def __init__(self, *, fail_on_write: bool = False) -> None:
-        self.notifications: list[JsonRpcNotification] = []
+        self.events: list[EventPushEnvelope] = []
         self._close_callbacks: list[Callable[[], None]] = []
         self._fail_on_write = fail_on_write
         self._closed = False
-        self.write_notifications_count = 0
+        self.write_events_count = 0
 
     def add_close_callback(self, callback: Callable[[], None]) -> None:
         if self._closed:
@@ -33,16 +32,16 @@ class RecordingConnection:
 
         self._close_callbacks.append(callback)
 
-    async def write_notification(self, notification: JsonRpcNotification) -> None:
+    async def write_event(self, event: EventPushEnvelope) -> None:
         if self._fail_on_write:
             raise ConnectionError("client disconnected")
-        self.notifications.append(notification)
+        self.events.append(event)
 
-    async def write_notifications(self, notifications: list[JsonRpcNotification]) -> None:
+    async def write_events(self, events: list[EventPushEnvelope]) -> None:
         if self._fail_on_write:
             raise ConnectionError("client disconnected")
-        self.write_notifications_count += 1
-        self.notifications.extend(notifications)
+        self.write_events_count += 1
+        self.events.extend(events)
 
     def close(self) -> None:
         if self._closed:
@@ -58,11 +57,11 @@ class RecordingConnection:
 def test_ipc_broadcaster_filters_by_event_type_and_run_id() -> None:
     topic_connection, scoped_connection = asyncio.run(_broadcast_filtered_events())
 
-    topic_events = [_event_type(notification) for notification in topic_connection.notifications]
-    scoped_events = [_event_type(notification) for notification in scoped_connection.notifications]
+    topic_events = [_event_type(event) for event in topic_connection.events]
+    scoped_events = [_event_type(event) for event in scoped_connection.events]
 
-    assert topic_events == ["run_started", "run_started"]
-    assert scoped_events == ["run_started", "step_started", "run_completed"]
+    assert topic_events == ["run.started", "run.started"]
+    assert scoped_events == ["run.started", "step.started", "run.finished"]
 
 
 async def _broadcast_filtered_events() -> tuple[RecordingConnection, RecordingConnection]:
@@ -89,11 +88,11 @@ async def _broadcast_filtered_events() -> tuple[RecordingConnection, RecordingCo
 def test_ipc_broadcaster_replays_only_matching_history(tmp_path: Path) -> None:
     connection = asyncio.run(_replay_matching_history(tmp_path))
 
-    assert [_event_type(notification) for notification in connection.notifications] == [
-        "step_started",
-        "run_completed",
+    assert [_event_type(event) for event in connection.events] == [
+        "step.started",
+        "run.finished",
     ]
-    assert connection.write_notifications_count == 1
+    assert connection.write_events_count == 1
 
 
 async def _replay_matching_history(tmp_path: Path) -> RecordingConnection:
@@ -130,7 +129,7 @@ def test_ipc_broadcaster_replay_rejects_invalid_history_line(tmp_path: Path) -> 
     runs_dir = tmp_path / "runs"
     run_dir = runs_dir / "run-1"
     run_dir.mkdir(parents=True)
-    (run_dir / "events.jsonl").write_text('{"type":"run_started","data":[]}\n', encoding="utf-8")
+    (run_dir / "events.jsonl").write_text('{"type":"run.started","data":[]}\n', encoding="utf-8")
 
     async def replay() -> None:
         broadcaster = IpcEventBroadcaster(runs_dir)
@@ -178,10 +177,9 @@ def test_ipc_broadcaster_immediately_reclaims_already_closed_connection() -> Non
     assert broadcaster.subscriber_count == 0
 
 
-def _event_type(notification: JsonRpcNotification) -> str:
-    assert notification.method == EVENT_PUBLISH_METHOD
-    assert isinstance(notification.params, dict)
-    event = notification.params["event"]
+def _event_type(envelope: EventPushEnvelope) -> str:
+    assert envelope.kind == "event"
+    event = envelope.event
     assert isinstance(event, dict)
     event_type = event["type"]
     assert isinstance(event_type, str)

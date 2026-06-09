@@ -12,19 +12,19 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 class AgentEventType(StrEnum):
     """Known lifecycle event names emitted during an agent run."""
 
-    RUN_STARTED = "run_started"
-    STEP_STARTED = "step_started"
-    STEP_FINISHED = "step_finished"
-    LLM_REQUEST_STARTED = "llm_request_started"
-    LLM_TOKEN = "llm_token"
-    LLM_USAGE = "llm_usage"
-    LLM_MODEL_SELECTED = "llm_model_selected"
-    LLM_RESPONSE_COMPLETED = "llm_response_completed"
-    TOOL_CALL_STARTED = "tool_call_started"
-    TOOL_CALL_COMPLETED = "tool_call_completed"
-    RUN_COMPLETED = "run_completed"
-    RUN_CANCELLED = "run_cancelled"
-    RUN_FAILED = "run_failed"
+    RUN_STARTED = "run.started"
+    STEP_STARTED = "step.started"
+    STEP_FINISHED = "step.finished"
+    LLM_REQUEST_STARTED = "llm.request_started"
+    LLM_TOKEN = "llm.token"
+    LLM_USAGE = "llm.usage"
+    LLM_MODEL_SELECTED = "llm.model_selected"
+    LLM_RESPONSE_COMPLETED = "llm.response_completed"
+    TOOL_CALL_STARTED = "tool.call_started"
+    TOOL_CALL_COMPLETED = "tool.call_finished"
+    RUN_COMPLETED = "run.finished"
+    RUN_CANCELLED = "run.cancelled"
+    RUN_FAILED = "run.failed"
 
 
 class AgentEvent(BaseModel):
@@ -152,6 +152,8 @@ class RunCompletedEvent(AgentEvent):
     message: str = "run completed"
     goal: str
     run_id: str | None = None
+    status: str = "success"
+    steps: int | None = None
 
 
 class RunCancelledEvent(AgentEvent):

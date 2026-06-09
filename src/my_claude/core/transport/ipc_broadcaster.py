@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import uuid
 from collections.abc import Callable
@@ -12,8 +13,7 @@ from typing import Protocol
 from pydantic import ValidationError
 
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
-from my_claude.core.bus.command import EVENT_PUBLISH_METHOD
-from my_claude.core.bus.envelope import JsonRpcNotification, make_notification
+from my_claude.core.bus.envelope import EventPushEnvelope
 
 
 class IpcEventConnection(Protocol):
@@ -21,9 +21,9 @@ class IpcEventConnection(Protocol):
 
     def add_close_callback(self, callback: IpcConnectionClosedCallback) -> None: ...
 
-    async def write_notification(self, notification: JsonRpcNotification) -> None: ...
+    async def write_event(self, event: EventPushEnvelope) -> None: ...
 
-    async def write_notifications(self, notifications: list[JsonRpcNotification]) -> None: ...
+    async def write_events(self, events: list[EventPushEnvelope]) -> None: ...
 
 
 type IpcConnectionClosedCallback = Callable[[], None]
@@ -35,6 +35,8 @@ class IpcEventSubscription:
 
     subscription_id: str
     connection: IpcEventConnection
+    topics: tuple[str, ...] = ("*",)
+    scope: str = "global"
     event_types: frozenset[AgentEventType] | None = None
     run_id: str | None = None
 
@@ -60,6 +62,8 @@ class IpcEventBroadcaster:
         self,
         connection: IpcEventConnection,
         *,
+        topics: list[str] | None = None,
+        scope: str = "global",
         event_types: list[AgentEventType] | None = None,
         run_id: str | None = None,
     ) -> str:
@@ -67,6 +71,8 @@ class IpcEventBroadcaster:
         subscription = IpcEventSubscription(
             subscription_id=subscription_id,
             connection=connection,
+            topics=_normalize_topics(topics),
+            scope=scope,
             event_types=None if event_types is None else frozenset(event_types),
             run_id=run_id,
         )
@@ -82,27 +88,37 @@ class IpcEventBroadcaster:
         connection: IpcEventConnection,
         *,
         replay_from: int | None,
+        replay_from_run: str | None = None,
+        topics: list[str] | None = None,
+        scope: str = "global",
         event_types: list[AgentEventType] | None = None,
         run_id: str | None = None,
-    ) -> None:
-        if replay_from is None or self._runs_dir is None:
-            return
+    ) -> int:
+        if replay_from is None and replay_from_run is None:
+            return 0
+        if self._runs_dir is None:
+            return 0
 
         subscription = IpcEventSubscription(
             subscription_id="history-replay",
             connection=connection,
+            topics=_normalize_topics(topics),
+            scope=scope,
             event_types=None if event_types is None else frozenset(event_types),
             run_id=run_id,
         )
-        notifications = [
-            _event_notification(sequence, event)
-            for sequence, event in self._read_history_events(run_id=run_id)
-            if sequence >= replay_from and self._matches(subscription, event)
+        start_sequence = replay_from or 1
+        history_run_id = replay_from_run or run_id
+        event_frames = [
+            _event_frame(event)
+            for sequence, event in self._read_history_events(run_id=history_run_id)
+            if sequence >= start_sequence and self._matches(subscription, event)
         ]
-        if not notifications:
-            return
+        if not event_frames:
+            return 0
 
-        await connection.write_notifications(notifications)
+        await connection.write_events(event_frames)
+        return len(event_frames)
 
     async def handle(self, event: AgentEvent) -> None:
         sequence = self._next_sequence
@@ -129,6 +145,12 @@ class IpcEventBroadcaster:
         if subscription.run_id is not None and _event_run_id(event) != subscription.run_id:
             return False
 
+        if not _matches_topic(event.type.value, subscription.topics):
+            return False
+
+        if not _matches_scope(_event_run_id(event), subscription.scope):
+            return False
+
         return True
 
     async def _push(
@@ -137,9 +159,8 @@ class IpcEventBroadcaster:
         sequence: int,
         event: AgentEvent,
     ) -> None:
-        await connection.write_notification(
-            _event_notification(sequence, event)
-        )
+        del sequence
+        await connection.write_event(_event_frame(event))
 
     def _read_history_events(self, *, run_id: str | None) -> list[tuple[int, AgentEvent]]:
         if self._runs_dir is None:
@@ -200,11 +221,24 @@ def _deserialize_history_event(line: str) -> AgentEvent:
     return KnownAgentEventAdapter.validate_python(event_payload)
 
 
-def _event_notification(sequence: int, event: AgentEvent) -> JsonRpcNotification:
-    return make_notification(
-        EVENT_PUBLISH_METHOD,
-        {
-            "sequence": sequence,
-            "event": event.model_dump(mode="json"),
-        },
-    )
+def _event_frame(event: AgentEvent) -> EventPushEnvelope:
+    return EventPushEnvelope(event=event.model_dump(mode="json"))
+
+
+def _normalize_topics(topics: list[str] | None) -> tuple[str, ...]:
+    if not topics:
+        return ("*",)
+
+    return tuple(topics)
+
+
+def _matches_topic(event_type: str, topics: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatch(event_type, topic) for topic in topics)
+
+
+def _matches_scope(run_id: str | None, scope: str) -> bool:
+    if scope == "global":
+        return True
+    if scope.startswith("run:"):
+        return run_id == scope[4:]
+    return False
