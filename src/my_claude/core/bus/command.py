@@ -5,11 +5,15 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field
 
 from my_claude.core.bus.envelope import JsonRpcRequest
+from my_claude.core.bus.events import AgentEventType
 
 CORE_PING_METHOD: Literal["core.ping"] = "core.ping"
+EVENT_SUBSCRIBE_METHOD: Literal["event.subscribe"] = "event.subscribe"
+EVENT_PUBLISH_METHOD: Literal["event.publish"] = "event.publish"
+AGENT_RUN_METHOD: Literal["agent.run"] = "agent.run"
 PACKAGE_NAME = "MyClaude"
 FALLBACK_VERSION = "0.1.0"
 
@@ -39,31 +43,85 @@ class CorePingResult(BaseModel):
     server_version: str
 
 
-BusCommand = CorePingCommand
-BusResult = CorePingResult
+class EventSubscribeParams(BaseModel):
+    """Parameters for subscribing to pushed runtime events."""
 
-BusCommandAdapter = TypeAdapter(BusCommand)
-BusResultAdapter = TypeAdapter(BusResult)
+    model_config = ConfigDict(extra="forbid")
+
+    replay_from: int | None = Field(default=None, ge=1)
+    event_types: list[AgentEventType] | None = None
+    run_id: str | None = Field(default=None, min_length=1)
+
+
+class EventSubscribeCommand(BaseModel):
+    """Command envelope for opening an event stream on the current connection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["event.subscribe"] = EVENT_SUBSCRIBE_METHOD
+    params: EventSubscribeParams = Field(default_factory=EventSubscribeParams)
+
+
+class EventSubscribeResult(BaseModel):
+    """Result returned after registering the event stream."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subscription_id: str
+    next_sequence: int
+
+
+class AgentRunParams(BaseModel):
+    """Parameters for requesting an agent run from the daemon."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal: str = Field(min_length=1)
+
+
+class AgentRunCommand(BaseModel):
+    """Command envelope for triggering an agent run in the daemon."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["agent.run"] = AGENT_RUN_METHOD
+    params: AgentRunParams
+
+
+class AgentRunResult(BaseModel):
+    """Result returned immediately after the daemon accepts an agent run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: Literal[True] = True
+    run_id: str
+    goal: str
+    timeline_path: str
+
+
+BusCommand = CorePingCommand | EventSubscribeCommand | AgentRunCommand
+BusResult = CorePingResult | EventSubscribeResult | AgentRunResult
 
 
 def command_from_request(request: JsonRpcRequest) -> BusCommand:
-    if request.method != CORE_PING_METHOD:
+    if request.method not in {CORE_PING_METHOD, EVENT_SUBSCRIBE_METHOD, AGENT_RUN_METHOD}:
         raise ValueError(f"unknown command method: {request.method}")
 
     params = request.params if request.params is not None else {}
     if not isinstance(params, dict):
-        raise ValueError("core.ping params must be an object")
+        raise ValueError(f"{request.method} params must be an object")
 
-    return BusCommandAdapter.validate_python(
-        {
-            "method": request.method,
-            "params": params,
-        }
-    )
+    payload = {"method": request.method, "params": params}
+    if request.method == CORE_PING_METHOD:
+        return CorePingCommand.model_validate(payload)
+    if request.method == EVENT_SUBSCRIBE_METHOD:
+        return EventSubscribeCommand.model_validate(payload)
+
+    return AgentRunCommand.model_validate(payload)
 
 
 def result_to_json(result: BusResult) -> dict[str, Any]:
-    return BusResultAdapter.validate_python(result).model_dump()
+    return result.model_dump(mode="json")
 
 
 def ping_result(uptime_seconds: float, server_version: str | None = None) -> CorePingResult:

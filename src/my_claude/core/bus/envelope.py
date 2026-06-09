@@ -51,6 +51,16 @@ class JsonRpcRequest(BaseModel):
     params: dict[str, Any] | list[Any] | None = None
 
 
+class JsonRpcNotification(BaseModel):
+    """Server-pushed JSON-RPC notification frame without a response id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    jsonrpc: Literal["2.0"] = "2.0"
+    method: str = Field(min_length=1)
+    params: dict[str, Any] | list[Any] | None = None
+
+
 class JsonRpcSuccessResponse(BaseModel):
     """JSON-RPC response frame for successful command execution."""
 
@@ -79,12 +89,23 @@ def parse_request(raw: bytes | str) -> JsonRpcRequest:
     return JsonRpcRequest.model_validate(_loads_json_object(raw))
 
 
+def parse_notification(raw: bytes | str) -> JsonRpcNotification:
+    return JsonRpcNotification.model_validate(_loads_json_object(raw))
+
+
 def parse_response(raw: bytes | str) -> JsonRpcResponse:
     return JsonRpcResponseAdapter.validate_python(_loads_json_object(raw))
 
 
 def make_success_response(request_id: JsonRpcId, result: Any) -> JsonRpcSuccessResponse:
     return JsonRpcSuccessResponse(id=request_id, result=result)
+
+
+def make_notification(
+    method: str,
+    params: dict[str, Any] | list[Any] | None = None,
+) -> JsonRpcNotification:
+    return JsonRpcNotification(method=method, params=params)
 
 
 def make_error_response(

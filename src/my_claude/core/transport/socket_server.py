@@ -6,14 +6,16 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from contextvars import ContextVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from my_claude.core.bus.command import BusResult, command_from_request, result_to_json
 from my_claude.core.bus.envelope import (
     JsonRpcErrorCode,
     JsonRpcErrorResponse,
     JsonRpcId,
+    JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcSuccessResponse,
     make_error_response,
@@ -24,6 +26,66 @@ from my_claude.core.bus.envelope import (
 
 RouteHandler = Callable[[JsonRpcRequest], Awaitable[BusResult]]
 JsonRpcReply = JsonRpcSuccessResponse | JsonRpcErrorResponse
+ConnectionClosedCallback = Callable[[], None]
+_CURRENT_TCP_CONNECTION: ContextVar[TCPConnection | None] = ContextVar(
+    "current_tcp_connection",
+    default=None,
+)
+
+
+class TCPConnection:
+    """Connection-scoped writer used by request handlers for server push messages."""
+
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self._writer = writer
+        self._write_lock = asyncio.Lock()
+        self._close_callbacks: list[ConnectionClosedCallback] = []
+        self._closed = False
+
+    def add_close_callback(self, callback: ConnectionClosedCallback) -> None:
+        if self._closed:
+            callback()
+            return
+
+        self._close_callbacks.append(callback)
+
+    async def write_model(self, model: BaseModel) -> None:
+        async with self._write_lock:
+            self._writer.write(to_ndjson(model))
+            await self._writer.drain()
+
+    async def write_notification(self, notification: JsonRpcNotification) -> None:
+        await self.write_notifications([notification])
+
+    async def write_notifications(self, notifications: list[JsonRpcNotification]) -> None:
+        async with self._write_lock:
+            for notification in notifications:
+                self._writer.write(to_ndjson(notification))
+            await self._writer.drain()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+        callbacks = tuple(self._close_callbacks)
+        self._close_callbacks.clear()
+        for callback in callbacks:
+            with suppress(Exception):
+                callback()
+
+        self._writer.close()
+        with suppress(Exception):
+            await self._writer.wait_closed()
+
+
+def current_tcp_connection() -> TCPConnection:
+    """Return the TCP connection currently dispatching this request."""
+    connection = _CURRENT_TCP_CONNECTION.get()
+    if connection is None:
+        raise RuntimeError("no current TCP connection is active")
+
+    return connection
 
 
 class TCPServer:
@@ -91,6 +153,7 @@ class TCPServer:
             self._connection_tasks.add(task)
 
         peer = writer.get_extra_info("peername")
+        connection = TCPConnection(writer)
         self.logger.debug("client connected: %s", peer)
 
         try:
@@ -111,26 +174,23 @@ class TCPServer:
                     await self._write_response(writer, self._request_too_large_error())
                     break
 
-                response = await self.dispatch(line)
-                await self._write_response(writer, response)
+                response = await self.dispatch(line, connection)
+                await connection.write_model(response)
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger.exception("client handling failed: %s", peer)
             with suppress(Exception):
-                await self._write_response(
-                    writer,
+                await connection.write_model(
                     make_error_response(None, JsonRpcErrorCode.INTERNAL_ERROR),
                 )
         finally:
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
+            await connection.close()
             if task is not None:
                 self._connection_tasks.discard(task)
             self.logger.debug("client disconnected: %s", peer)
 
-    async def dispatch(self, line: bytes) -> JsonRpcReply:
+    async def dispatch(self, line: bytes, connection: TCPConnection) -> JsonRpcReply:
         request_id: JsonRpcId = None
 
         try:
@@ -153,7 +213,11 @@ class TCPServer:
                 )
 
             command_from_request(request)
-            result = await handler(request)
+            token = _CURRENT_TCP_CONNECTION.set(connection)
+            try:
+                result = await handler(request)
+            finally:
+                _CURRENT_TCP_CONNECTION.reset(token)
             return make_success_response(request_id, result_to_json(result))
         except (ValidationError, ValueError) as error:
             return make_error_response(

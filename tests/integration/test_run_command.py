@@ -7,11 +7,13 @@ import logging
 import os
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+import my_claude.core.app as app_module
 import my_claude.core.runner as runner_module
-from my_claude.agent.agent import Agent
+from my_claude.agent.agent import Agent, AgentResult
 from my_claude.agent.events import (
     AgentEvent,
     AgentEventType,
@@ -28,16 +30,23 @@ from my_claude.agent.events import (
 )
 from my_claude.agent.memory import RunStatus, TextBlock, WorkingMemory
 from my_claude.agent.tools import ToolDefinition, ToolRegistry
-from my_claude.cli.commands.run import StdoutPrinter
+from my_claude.cli.commands.run import StdoutPrinter, _run_over_socket
 from my_claude.cli.main import main
+from my_claude.core.app import register_routes
+from my_claude.core.bus.command import AGENT_RUN_METHOD, EVENT_SUBSCRIBE_METHOD, BusResult
+from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.context import AnthropicMessage
 from my_claude.core.events.bus import EventBus
 from my_claude.core.runner import (
+    RunContext,
+    RunResult,
     prepare_run_context,
     run_goal,
     run_prepared_context,
 )
+from my_claude.core.transport.socket_client import SocketClient
+from my_claude.core.transport.socket_server import RouteHandler, TCPServer
 from my_claude.llm.client import (
     LLMResponse,
     LocalLLMClient,
@@ -58,23 +67,125 @@ def test_run_command_requires_goal(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_run_command_accepts_goal(
     capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("MYCLAUDE_LLM_PROVIDER", "local")
-    monkeypatch.delenv("MYCLAUDE_LLM_API_KEY", raising=False)
-    monkeypatch.setenv("MYCLAUDE_RUNS_DIR", str(tmp_path / "runs"))
-
-    exit_code = main(["run", "--goal", "write tests"])
+    exit_code, methods = asyncio.run(_run_via_test_daemon("write tests", tmp_path))
 
     captured = capsys.readouterr()
 
     assert exit_code == 0
+    assert methods[:2] == [EVENT_SUBSCRIBE_METHOD, AGENT_RUN_METHOD]
     assert "[run] 20" in captured.out
     assert "[step 1] planning..." in captured.out
     assert "Local LLM placeholder accepted goal: write tests" in captured.out
     assert "[step 1] done" in captured.out
     assert "[run] success  1 steps" in captured.out
+
+
+def test_agent_run_route_returns_run_id_before_background_run_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result, background_started, background_finished = asyncio.run(
+        _agent_run_returns_before_background_finish(monkeypatch, tmp_path)
+    )
+
+    assert result["accepted"] is True
+    assert result["run_id"]
+    assert result["goal"] == "write tests"
+    assert result["timeline_path"].endswith("events.jsonl")
+    assert background_started is True
+    assert background_finished is False
+
+
+async def _agent_run_returns_before_background_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[dict[str, object], bool, bool]:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = False
+
+    async def slow_run_prepared_context(
+        context: RunContext,
+        *,
+        listeners: Sequence[object] = (),
+    ) -> RunResult:
+        nonlocal finished
+        started.set()
+        await release.wait()
+        finished = True
+        return RunResult(
+            run_id=context.run_id,
+            run_dir=context.run_dir,
+            timeline_path=context.timeline_path,
+            agent_result=AgentResult(
+                goal=context.working_memory.goal,
+                final_response="done",
+            ),
+        )
+
+    monkeypatch.setattr(app_module, "run_prepared_context", slow_run_prepared_context)
+
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(server, config=config, server_version="test-version")
+    await server.start()
+
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            result = await client.request(AGENT_RUN_METHOD, {"goal": "write tests"})
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            return result, started.is_set(), finished
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+        await server.shutdown()
+
+
+async def _run_via_test_daemon(goal: str, tmp_path: Path) -> tuple[int, list[str]]:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(server, config=config, server_version="test-version")
+    methods: list[str] = []
+
+    for method, handler in tuple(server.routes.items()):
+
+        async def recording_handler(
+            request: JsonRpcRequest,
+            *,
+            method: str = method,
+            handler: object = handler,
+        ) -> BusResult:
+            methods.append(method)
+            typed_handler = cast(RouteHandler, handler)
+            return await typed_handler(request)
+
+        server.routes[method] = recording_handler
+
+    await server.start()
+    try:
+        client_config = config.model_copy(
+            update={
+                "core_host": "127.0.0.1",
+                "core_port": _bound_port(server),
+            }
+        )
+        exit_code = await _run_over_socket(goal, config=client_config, printer=StdoutPrinter())
+        return exit_code, methods
+    finally:
+        await server.shutdown()
+
+
+def _bound_port(server: TCPServer) -> int:
+    if server._server is None or not server._server.sockets:
+        raise RuntimeError("test server did not start")
+
+    return int(server._server.sockets[0].getsockname()[1])
 
 
 def test_config_accepts_anthropic_env_aliases(
