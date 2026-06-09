@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from my_claude.agent.events import EventHandler
 from my_claude.agent.tools import ToolDefinition
 from my_claude.core.config import AppConfig
 from my_claude.core.context import AnthropicMessage, MessageContentBlock, TextBlock, ToolUseBlock
@@ -129,7 +130,12 @@ class OpenAICompatibleLLMClient:
         )
 
 
-def create_llm_client(config: AppConfig) -> LLMClient:
+def create_llm_client(
+    config: AppConfig,
+    *,
+    event_handler: EventHandler | None = None,
+    run_id: str | None = None,
+) -> LLMClient:
     if config.llm_provider == "local":
         return LocalLLMClient()
 
@@ -149,7 +155,9 @@ def create_llm_client(config: AppConfig) -> LLMClient:
                 base_url=_anthropic_messages_url(config.llm_base_url),
                 timeout_seconds=config.llm_timeout_seconds,
                 max_tokens=config.llm_max_tokens,
-            )
+            ),
+            event_handler=event_handler,
+            run_id=run_id,
         )
 
     if config.llm_api_key is None:

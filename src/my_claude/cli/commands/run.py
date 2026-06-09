@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -43,12 +44,19 @@ class StdoutPrinter:
             self._steps = 0
             self._response_had_tokens = False
             self._cursor_open = False
-            print(f"[run] goal: {event.data.get('goal', '')}", file=self._stream, flush=True)
-        elif event.type == AgentEventType.LLM_REQUEST_STARTED:
-            self._steps += 1
+            run_id = event.data.get("run_id") or event.data.get("goal", "")
+            print(f"[run] {run_id}", file=self._stream, flush=True)
+        elif event.type == AgentEventType.STEP_STARTED:
+            self._ensure_newline()
             self._response_had_tokens = False
-            tool_count = event.data.get("tools", 0)
-            print(f"[llm] request started, tools={tool_count}", file=self._stream, flush=True)
+            self._steps = int(event.data.get("step", self._steps + 1))
+            print(f"[step {self._steps}] planning...", file=self._stream, flush=True)
+        elif event.type == AgentEventType.STEP_FINISHED:
+            self._ensure_newline()
+            step = event.data.get("step", self._steps)
+            print(f"[step {step}] done", file=self._stream, flush=True)
+        elif event.type == AgentEventType.LLM_REQUEST_STARTED:
+            self._response_had_tokens = False
         elif event.type == AgentEventType.LLM_TOKEN:
             print(event.data.get("token", ""), end="", file=self._stream, flush=True)
             self._response_had_tokens = True
@@ -60,17 +68,19 @@ class StdoutPrinter:
                 print(file=self._stream, flush=True)
                 self._cursor_open = False
         elif event.type == AgentEventType.TOOL_CALL_STARTED:
-            print(file=self._stream, flush=True)
-            self._cursor_open = False
+            self._ensure_newline()
             tool_name = event.data.get("tool_name", "")
-            print(f"[tool] {tool_name} started", file=self._stream, flush=True)
+            arguments = event.data.get("arguments", {})
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+            print(f"[tool] {tool_name} {arguments_text}", file=self._stream, flush=True)
         elif event.type == AgentEventType.TOOL_CALL_COMPLETED:
             tool_name = event.data.get("tool_name", "")
             error = event.data.get("error")
+            elapsed_ms = event.data.get("elapsed_ms", 0)
             if error:
-                print(f"[tool] {tool_name} failed: {error}", file=self._stream, flush=True)
+                print(f"[tool] {tool_name} ✗  {error}", file=self._error_stream, flush=True)
             else:
-                print(f"[tool] {tool_name} completed", file=self._stream, flush=True)
+                print(f"[tool] {tool_name} ✓  {elapsed_ms}ms", file=self._stream, flush=True)
         elif event.type == AgentEventType.RUN_COMPLETED:
             self._print_finished("success", self._stream)
         elif event.type == AgentEventType.RUN_CANCELLED:
@@ -81,17 +91,20 @@ class StdoutPrinter:
                 print(f"[run] error: {error}", file=self._error_stream, flush=True)
             self._print_finished("failed", self._error_stream)
 
-    def _print_finished(self, status: str, stream: TextIO) -> None:
+    def _ensure_newline(self) -> None:
         if self._cursor_open:
             print(file=self._stream, flush=True)
             self._cursor_open = False
+
+    def _print_finished(self, status: str, stream: TextIO) -> None:
+        self._ensure_newline()
 
         elapsed_seconds = 0.0
         if self._started_at is not None:
             elapsed_seconds = self._clock() - self._started_at
 
         print(
-            f"[run] {status} | steps={self._steps} | elapsed={elapsed_seconds:.1f}s",
+            f"[run] {status}  {self._steps} steps  {elapsed_seconds:.1f}s",
             file=stream,
             flush=True,
         )
@@ -114,7 +127,6 @@ def main(args: argparse.Namespace) -> int:
 async def _run_async(args: argparse.Namespace) -> int:
     config = load_config()
     printer = StdoutPrinter()
-
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

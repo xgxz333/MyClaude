@@ -21,6 +21,8 @@ from my_claude.agent.events import (
     RunCompletedEvent,
     RunFailedEvent,
     RunStartedEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
     ToolCallCompletedEvent,
     ToolCallStartedEvent,
 )
@@ -31,7 +33,11 @@ from my_claude.cli.main import main
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.context import AnthropicMessage
 from my_claude.core.events.bus import EventBus
-from my_claude.core.runner import prepare_run_context, run_goal
+from my_claude.core.runner import (
+    prepare_run_context,
+    run_goal,
+    run_prepared_context,
+)
 from my_claude.llm.client import (
     LLMResponse,
     LocalLLMClient,
@@ -64,10 +70,11 @@ def test_run_command_accepts_goal(
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "[run] goal: write tests" in captured.out
-    assert "[llm] request started, tools=1" in captured.out
+    assert "[run] 20" in captured.out
+    assert "[step 1] planning..." in captured.out
     assert "Local LLM placeholder accepted goal: write tests" in captured.out
-    assert "[run] success | steps=1 | elapsed=" in captured.out
+    assert "[step 1] done" in captured.out
+    assert "[run] success  1 steps" in captured.out
 
 
 def test_config_accepts_anthropic_env_aliases(
@@ -148,7 +155,7 @@ def test_prepare_run_context_assembles_runtime_before_agent_loop(tmp_path: Path)
     assert context.run_id
     assert context.run_dir.exists()
     assert context.run_dir.parent == tmp_path / "runs"
-    assert context.timeline_path == context.run_dir / "timeline.jsonl"
+    assert context.timeline_path == context.run_dir / "events.jsonl"
     assert context.working_memory.run_id == context.run_id
     assert context.working_memory.goal == "ship it"
     assert context.working_memory.max_steps == config.agent_max_iterations
@@ -172,11 +179,63 @@ def test_runner_writes_timeline_file(tmp_path: Path) -> None:
     assert result.agent_result.goal == "ship it"
     assert [event["type"] for event in events] == [
         "run_started",
+        "step_started",
         "llm_request_started",
         "llm_response_completed",
+        "step_finished",
         "run_completed",
     ]
     assert events[0]["data"]["goal"] == "ship it"
+    assert events[1]["data"]["step"] == 1
+
+
+def test_prepared_runner_writes_timeline_and_broadcasts_events(tmp_path: Path) -> None:
+    broadcast_events: list[AgentEventType] = []
+
+    async def broadcaster(event: AgentEvent) -> None:
+        broadcast_events.append(event.type)
+
+    config = AppConfig(runs_dir=tmp_path / "runs")
+    context = prepare_run_context("ship it", config=config)
+
+    result = asyncio.run(run_prepared_context(context, listeners=[broadcaster]))
+    timeline_events = [
+        json.loads(line)["type"]
+        for line in result.timeline_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert timeline_events == [event_type.value for event_type in broadcast_events]
+    assert broadcast_events == [
+        AgentEventType.RUN_STARTED,
+        AgentEventType.STEP_STARTED,
+        AgentEventType.LLM_REQUEST_STARTED,
+        AgentEventType.LLM_RESPONSE_COMPLETED,
+        AgentEventType.STEP_FINISHED,
+        AgentEventType.RUN_COMPLETED,
+    ]
+
+
+def test_runner_publishes_run_started_before_initializing_llm_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[AgentEventType] = []
+    events_seen_when_llm_initialized: list[AgentEventType] = []
+
+    async def listener(event: AgentEvent) -> None:
+        events.append(event.type)
+
+    def create_client(_config: AppConfig, **_kwargs: object) -> LocalLLMClient:
+        events_seen_when_llm_initialized.extend(events)
+        return LocalLLMClient()
+
+    monkeypatch.setattr(runner_module, "create_llm_client", create_client)
+    context = prepare_run_context("ship it", config=AppConfig(runs_dir=tmp_path / "runs"))
+
+    asyncio.run(run_prepared_context(context, listeners=[listener]))
+
+    assert events_seen_when_llm_initialized == [AgentEventType.RUN_STARTED]
+    assert events[0] == AgentEventType.RUN_STARTED
 
 
 def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
@@ -202,7 +261,7 @@ def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
         monkeypatch.setattr(
             runner_module,
             "create_llm_client",
-            lambda _config: SlowLLMClient(started),
+            lambda _config, **_kwargs: SlowLLMClient(started),
         )
         config = AppConfig(runs_dir=tmp_path / "runs")
         task = asyncio.create_task(run_goal("cancel me", config=config))
@@ -212,7 +271,7 @@ def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        return next(config.runs_dir.glob("*/timeline.jsonl"))
+        return next(config.runs_dir.glob("*/events.jsonl"))
 
     caplog.set_level(logging.INFO)
 
@@ -271,10 +330,13 @@ def test_agent_dispatches_events_to_handler() -> None:
     assert result.final_response.startswith("Local LLM placeholder accepted goal: ship it")
     assert [event.type for event in events] == [
         AgentEventType.RUN_STARTED,
+        AgentEventType.STEP_STARTED,
         AgentEventType.LLM_REQUEST_STARTED,
         AgentEventType.LLM_RESPONSE_COMPLETED,
+        AgentEventType.STEP_FINISHED,
         AgentEventType.RUN_COMPLETED,
     ]
+    assert events[0].data["run_id"] == "local"
 
 
 def test_event_bus_broadcasts_run_and_tool_events_to_async_subscribers() -> None:
@@ -325,6 +387,7 @@ def test_stdout_printer_formats_tokens_tools_and_final_summary() -> None:
 
     async def publish_events() -> None:
         await bus.publish(RunStartedEvent(goal="ship it"))
+        await bus.publish(StepStartedEvent(run_id="run-1", step=1))
         await bus.publish(LLMRequestStartedEvent(model_input_messages=1, tools=1))
         await bus.publish(LLMTokenEvent(token="hello"))
         await bus.publish(LLMTokenEvent(token=" world"))
@@ -340,17 +403,21 @@ def test_stdout_printer_formats_tokens_tools_and_final_summary() -> None:
                 tool_use_id="tool-1",
                 tool_name="read_file",
                 result="ok",
+                elapsed_ms=1,
             )
         )
         await bus.publish(LLMResponseCompletedEvent(message="", content=""))
+        await bus.publish(StepFinishedEvent(run_id="run-1", step=1))
         await bus.publish(RunCompletedEvent(goal="ship it"))
 
     asyncio.run(publish_events())
 
     output = stream.getvalue()
-    assert "hello world\n[tool] read_file started" in output
-    assert "[tool] read_file completed" in output
-    assert "[run] success | steps=1 | elapsed=2.3s" in output
+    assert "[step 1] planning..." in output
+    assert 'hello world\n[tool] read_file {"path": "README.md"}' in output
+    assert "[tool] read_file ✓  1ms" in output
+    assert "[step 1] done" in output
+    assert "[run] success  1 steps  2.3s" in output
     assert error_stream.getvalue() == ""
 
 
@@ -369,6 +436,7 @@ def test_stdout_printer_formats_run_failure_error() -> None:
 
     async def publish_events() -> None:
         await bus.publish(RunStartedEvent(goal="ship it"))
+        await bus.publish(StepStartedEvent(run_id="run-1", step=1))
         await bus.publish(LLMRequestStartedEvent(model_input_messages=1, tools=0))
         await bus.publish(RunFailedEvent(error="LLM request failed: HTTP Error 503"))
 
@@ -376,7 +444,7 @@ def test_stdout_printer_formats_run_failure_error() -> None:
 
     output = error_stream.getvalue()
     assert "[run] error: LLM request failed: HTTP Error 503" in output
-    assert "[run] failed | steps=1 | elapsed=2.0s" in output
+    assert "[run] failed  1 steps  2.0s" in output
 
 
 def test_llm_token_event_is_a_pydantic_event_model() -> None:
@@ -389,4 +457,5 @@ def test_llm_token_event_is_a_pydantic_event_model() -> None:
         "message": "llm token",
         "token": "hello",
         "index": 1,
+        "run_id": None,
     }

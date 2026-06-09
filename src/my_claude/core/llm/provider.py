@@ -10,6 +10,13 @@ from typing import Any
 
 import anthropic
 
+from my_claude.agent.events import (
+    EventHandler,
+    LLMModelSelectedEvent,
+    LLMTokenEvent,
+    LLMUsageEvent,
+    dispatch_event,
+)
 from my_claude.agent.tools import ToolDefinition
 from my_claude.core.context import (
     AnthropicMessage,
@@ -43,8 +50,16 @@ class AnthropicProviderConfig:
 class AnthropicStreamingProvider:
     """Call Anthropic Messages with streaming and normalize the response blocks."""
 
-    def __init__(self, config: AnthropicProviderConfig, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: AnthropicProviderConfig,
+        client: Any | None = None,
+        event_handler: EventHandler | None = None,
+        run_id: str | None = None,
+    ) -> None:
         self._config = config
+        self._event_handler = event_handler
+        self._run_id = run_id
         os.environ["ANTHROPIC_API_KEY"] = config.api_key
         os.environ["ANTHROPIC_BASE_URL"] = _anthropic_sdk_base_url(config.base_url)
         self._client = client or anthropic.AsyncAnthropic(
@@ -70,16 +85,60 @@ class AnthropicStreamingProvider:
         text_parts: list[str] = []
 
         try:
+            await self._emit_model_selected()
             async with self._client.messages.stream(**kwargs) as stream:
+                index = 0
                 async for text in stream.text_stream:
                     text_parts.append(text)
+                    await self._emit_token(text, index=index)
+                    index += 1
                 final_message = await stream.get_final_message()
         except anthropic.APIError as error:
             raise RuntimeError(f"LLM request failed: {error}") from error
 
+        await self._emit_usage(final_message)
         return _response_from_final_message(
             final_message,
             fallback_text="".join(text_parts),
+        )
+
+    async def _emit_model_selected(self) -> None:
+        if self._run_id is None:
+            return
+        await dispatch_event(
+            self._event_handler,
+            LLMModelSelectedEvent(run_id=self._run_id, model=self._config.model),
+        )
+
+    async def _emit_token(self, token: str, *, index: int) -> None:
+        if self._run_id is None:
+            return
+        await dispatch_event(
+            self._event_handler,
+            LLMTokenEvent(run_id=self._run_id, token=token, index=index),
+        )
+
+    async def _emit_usage(self, final_message: Any) -> None:
+        if self._run_id is None:
+            return
+
+        usage = getattr(final_message, "usage", None)
+        if usage is None:
+            return
+
+        await dispatch_event(
+            self._event_handler,
+            LLMUsageEvent(
+                run_id=self._run_id,
+                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                cache_read_input_tokens=int(
+                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                ),
+                cache_creation_input_tokens=int(
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                ),
+            ),
         )
 
 

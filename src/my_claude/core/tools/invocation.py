@@ -23,14 +23,20 @@ class ToolInvoker:
 
         validation_error = validate_tool_arguments(tool.definition.input_schema, arguments)
         if validation_error is not None:
-            return ToolResult.failure(validation_error)
+            return ToolResult.failure(validation_error, error_type="schema_error")
 
         try:
             return await asyncio.wait_for(tool.run(arguments), timeout=self.timeout_seconds)
         except TimeoutError:
-            return ToolResult.failure(f"tool timed out after {self.timeout_seconds:.2f}s")
+            return ToolResult.failure(
+                f"tool timed out after {self.timeout_seconds:.2f}s",
+                error_type="timeout",
+            )
         except Exception as error:
-            return ToolResult.failure(f"tool failed unexpectedly: {error}")
+            return ToolResult.failure(
+                f"tool failed unexpectedly: {error}",
+                error_type="runtime_error",
+            )
 
 
 def validate_tool_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:

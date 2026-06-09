@@ -14,14 +14,26 @@ class ToolResult:
     content: str
     is_error: bool = False
     error: str | None = None
+    error_type: str | None = None
 
     @classmethod
     def success(cls, content: str) -> ToolResult:
         return cls(content=content)
 
     @classmethod
-    def failure(cls, error: str, *, content: str | None = None) -> ToolResult:
-        return cls(content=content if content is not None else error, is_error=True, error=error)
+    def failure(
+        cls,
+        error: str,
+        *,
+        content: str | None = None,
+        error_type: str = "runtime_error",
+    ) -> ToolResult:
+        return cls(
+            content=content if content is not None else error,
+            is_error=True,
+            error=error,
+            error_type=error_type,
+        )
 
 
 @dataclass(frozen=True)
@@ -66,4 +78,3 @@ class FunctionTool:
             return result
 
         return ToolResult.success(result)
-

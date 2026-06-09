@@ -46,7 +46,12 @@ class Agent:
         self._loop_controller = loop_controller or LoopController()
         self._event_handler = event_handler
 
-    async def run(self, goal: str | None = None) -> AgentResult:
+    async def run(
+        self,
+        goal: str | None = None,
+        *,
+        emit_run_started: bool = True,
+    ) -> AgentResult:
         working_memory = self._working_memory
         if working_memory is None:
             if goal is None:
@@ -54,7 +59,8 @@ class Agent:
             working_memory = WorkingMemory.from_goal(goal)
 
         run_goal = working_memory.goal
-        await self._emit(RunStartedEvent(goal=run_goal))
+        if emit_run_started:
+            await self._emit(RunStartedEvent(goal=run_goal, run_id=working_memory.run_id))
 
         try:
             loop = AgentLoop(
