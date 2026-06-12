@@ -7,6 +7,7 @@ import asyncio
 import logging
 import signal
 import time
+from pathlib import Path
 
 from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
@@ -25,6 +26,8 @@ from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.logging_setup import setup_logging
 from my_claude.core.runner import RunResult, prepare_run_context, run_prepared_context
+from my_claude.core.trace.paths import DAEMON_TRACE_FILENAME
+from my_claude.core.trace.writer import TraceWriter
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from my_claude.core.transport.socket_server import TCPServer, current_tcp_connection
 
@@ -38,11 +41,16 @@ def register_routes(
     started_at: float | None = None,
     server_version: str | None = None,
     run_tasks: set[asyncio.Task[RunResult]] | None = None,
+    trace_writer: TraceWriter | None = None,
 ) -> None:
     start_time = started_at if started_at is not None else time.perf_counter()
     version = server_version or get_server_version()
     runtime_config = config or AppConfig()
-    event_broadcaster = IpcEventBroadcaster(runtime_config.runs_dir)
+    trace_emitter = trace_writer if runtime_config.trace_enabled else None
+    event_broadcaster = IpcEventBroadcaster(
+        runtime_config.runs_dir,
+        trace_emitter=trace_emitter,
+    )
     active_run_tasks: set[asyncio.Task[RunResult]] = run_tasks if run_tasks is not None else set()
 
     async def handle_core_ping(_request: JsonRpcRequest) -> BusResult:
@@ -92,6 +100,7 @@ def register_routes(
             run_prepared_context(
                 context,
                 listeners=[event_broadcaster.handle],
+                trace_writer=trace_emitter,
             )
         )
         active_run_tasks.add(run_task)
@@ -157,13 +166,24 @@ async def _run_async() -> None:
     config = load_config()
     setup_logging(config)
     shutdown_event = asyncio.Event()
+    trace_writer: TraceWriter | None = None
+    if config.trace_enabled:
+        trace_writer = TraceWriter(_trace_path(config))
+        await trace_writer.start()
     server = TCPServer(
         config.core_host,
         config.core_port,
         max_request_bytes=config.max_request_bytes,
+        trace_emitter=trace_writer,
     )
     run_tasks: set[asyncio.Task[RunResult]] = set()
-    register_routes(server, config=config, started_at=started_at, run_tasks=run_tasks)
+    register_routes(
+        server,
+        config=config,
+        started_at=started_at,
+        run_tasks=run_tasks,
+        trace_writer=trace_writer,
+    )
 
     logger = logging.getLogger(__name__)
     logger.info("core routes registered: %s", ", ".join(server.routes))
@@ -179,7 +199,14 @@ async def _run_async() -> None:
     try:
         await server.serve_until_stopped(shutdown_event)
     finally:
+        await server.shutdown()
         await _cancel_background_runs(run_tasks)
+        if trace_writer is not None:
+            await trace_writer.stop()
+
+
+def _trace_path(config: AppConfig) -> Path:
+    return config.trace_file or config.runs_dir / DAEMON_TRACE_FILENAME
 
 
 def run(argv: list[str] | None = None) -> int:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +16,13 @@ from pydantic import ValidationError
 
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
 from my_claude.core.bus.envelope import EventPushEnvelope
+from my_claude.core.trace.record import TraceRecord
+
+logger = logging.getLogger(__name__)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 class IpcEventConnection(Protocol):
@@ -27,6 +36,12 @@ class IpcEventConnection(Protocol):
 
 
 type IpcConnectionClosedCallback = Callable[[], None]
+
+
+class TraceEmitter(Protocol):
+    """Minimal trace sink used by the IPC event broadcaster."""
+
+    def emit(self, record: TraceRecord) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -44,8 +59,14 @@ class IpcEventSubscription:
 class IpcEventBroadcaster:
     """EventBus subscriber that filters and pushes agent events to IPC clients."""
 
-    def __init__(self, runs_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        runs_dir: Path | None = None,
+        *,
+        trace_emitter: TraceEmitter | None = None,
+    ) -> None:
         self._runs_dir = runs_dir
+        self._trace_emitter = trace_emitter
         self._subscribers: dict[str, IpcEventSubscription] = {}
         self._history: list[tuple[int, AgentEvent]] = []
         self._next_sequence = 1
@@ -67,7 +88,7 @@ class IpcEventBroadcaster:
         event_types: list[AgentEventType] | None = None,
         run_id: str | None = None,
     ) -> str:
-        subscription_id = uuid.uuid4().hex
+        subscription_id = f"sub-{uuid.uuid4().hex[:8]}"
         subscription = IpcEventSubscription(
             subscription_id=subscription_id,
             connection=connection,
@@ -109,15 +130,18 @@ class IpcEventBroadcaster:
         )
         start_sequence = replay_from or 1
         history_run_id = replay_from_run or run_id
-        event_frames = [
-            _event_frame(event)
+        events = [
+            event
             for sequence, event in self._read_history_events(run_id=history_run_id)
             if sequence >= start_sequence and self._matches(subscription, event)
         ]
-        if not event_frames:
+        if not events:
             return 0
 
+        event_frames = [_event_frame(event) for event in events]
         await connection.write_events(event_frames)
+        for event in events:
+            self._trace_push(subscription, event)
         return len(event_frames)
 
     async def handle(self, event: AgentEvent) -> None:
@@ -131,7 +155,7 @@ class IpcEventBroadcaster:
                 continue
 
             try:
-                await self._push(subscription.connection, sequence, event)
+                await self._push(subscription, sequence, event)
             except (ConnectionError, OSError, RuntimeError):
                 stale_subscribers.append(subscription_id)
 
@@ -155,12 +179,34 @@ class IpcEventBroadcaster:
 
     async def _push(
         self,
-        connection: IpcEventConnection,
+        subscription: IpcEventSubscription,
         sequence: int,
         event: AgentEvent,
     ) -> None:
         del sequence
-        await connection.write_event(_event_frame(event))
+        await subscription.connection.write_event(_event_frame(event))
+        self._trace_push(subscription, event)
+
+    def _trace_push(self, subscription: IpcEventSubscription, event: AgentEvent) -> None:
+        if self._trace_emitter is None:
+            return
+
+        record = TraceRecord(
+            ts=_now(),
+            direction="CORE→CLIENT",
+            layer="ipc",
+            kind="push",
+            run_id=_event_run_id(event),
+            client_id=_connection_client_id(subscription.connection),
+            data={
+                "sub_id": subscription.subscription_id,
+                "event_type": event.type.value,
+            },
+        )
+        try:
+            self._trace_emitter.emit(record)
+        except Exception:
+            logger.exception("failed to emit ipc push trace")
 
     def _read_history_events(self, *, run_id: str | None) -> list[tuple[int, AgentEvent]]:
         if self._runs_dir is None:
@@ -198,6 +244,19 @@ def _event_run_id(event: AgentEvent) -> str | None:
     run_id = event.data.get("run_id")
     if isinstance(run_id, str):
         return run_id
+
+    return None
+
+
+def _connection_client_id(connection: IpcEventConnection) -> str | None:
+    value = getattr(connection, "client_identity", None)
+    if isinstance(value, str):
+        return value
+
+    get_extra_info = getattr(connection, "get_extra_info", None)
+    if callable(get_extra_info):
+        peer = get_extra_info("peername", "<unknown>")
+        return str(peer)
 
     return None
 

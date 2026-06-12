@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -104,12 +106,13 @@ def test_provider_uses_anthropic_sdk_stream_and_parses_final_message() -> None:
         )
     )
 
-    assert fake_messages.kwargs["model"] == "claude-test"
-    assert fake_messages.kwargs["max_tokens"] == 256
-    assert fake_messages.kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert fake_messages.kwargs["messages"][0]["role"] == "user"
-    assert fake_messages.kwargs["messages"][0]["content"] == "ship it"
-    assert fake_messages.kwargs["tools"][0]["name"] == "echo"
+    kwargs = cast(dict[str, Any], fake_messages.kwargs)
+    assert kwargs["model"] == "claude-test"
+    assert kwargs["max_tokens"] == 256
+    assert kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert kwargs["messages"][0]["role"] == "user"
+    assert kwargs["messages"][0]["content"] == "ship it"
+    assert kwargs["tools"][0]["name"] == "echo"
     assert response.content == "Use the tool."
     assert len(response.content_blocks) == 2
     assert response.tool_uses()[0].input == {"value": "ok"}
@@ -154,7 +157,8 @@ def test_provider_normalizes_streamed_text_and_tool_use_blocks() -> None:
     assert tool_uses[0].name == "echo"
     assert tool_uses[0].input == {"value": "ok"}
     assert response.raw is not None
-    assert response.raw["message"]["stop_reason"] == "tool_use"
+    raw = cast(dict[str, Any], response.raw)
+    assert raw["message"]["stop_reason"] == "tool_use"
 
 
 def test_provider_reads_sse_json_events() -> None:
@@ -189,8 +193,8 @@ class FakeStream:
         pass
 
     @property
-    def text_stream(self):  # type: ignore[no-untyped-def]
-        async def stream_text():
+    def text_stream(self) -> AsyncIterator[str]:
+        async def stream_text() -> AsyncIterator[str]:
             for text in self._texts:
                 yield text
 

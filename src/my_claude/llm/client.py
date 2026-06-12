@@ -46,6 +46,8 @@ class LLMClient(Protocol):
         self,
         messages: Sequence[LLMMessage],
         tools: Sequence[ToolDefinition],
+        *,
+        step: int | None = None,
     ) -> LLMResponse: ...
 
 
@@ -56,7 +58,10 @@ class LocalLLMClient:
         self,
         messages: Sequence[LLMMessage],
         tools: Sequence[ToolDefinition],
+        *,
+        step: int | None = None,
     ) -> LLMResponse:
+        del step
         user_messages = [_message_text(message) for message in messages if message.role == "user"]
         goal = user_messages[-1] if user_messages else ""
         tool_count = len(tools)
@@ -81,7 +86,10 @@ class OpenAICompatibleLLMClient:
         self,
         messages: Sequence[LLMMessage],
         tools: Sequence[ToolDefinition],
+        *,
+        step: int | None = None,
     ) -> LLMResponse:
+        del step
         return await asyncio.to_thread(self._complete_blocking, messages, tools)
 
     def _complete_blocking(

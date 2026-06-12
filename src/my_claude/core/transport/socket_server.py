@@ -7,6 +7,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -24,6 +26,7 @@ from my_claude.core.bus.envelope import (
     parse_request,
     to_ndjson,
 )
+from my_claude.core.trace.record import TraceRecord
 
 RouteHandler = Callable[[JsonRpcRequest], Awaitable[BusResult]]
 JsonRpcReply = JsonRpcSuccessResponse | JsonRpcErrorResponse
@@ -32,16 +35,34 @@ _CURRENT_TCP_CONNECTION: ContextVar[TCPConnection | None] = ContextVar(
     "current_tcp_connection",
     default=None,
 )
+logger = logging.getLogger(__name__)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class TraceEmitter(Protocol):
+    """Minimal trace sink used by the socket transport."""
+
+    def emit(self, record: TraceRecord) -> None: ...
 
 
 class TCPConnection:
     """Connection-scoped writer used by request handlers for server push messages."""
 
-    def __init__(self, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        writer: asyncio.StreamWriter,
+        *,
+        trace_emitter: TraceEmitter | None = None,
+    ) -> None:
         self._writer = writer
         self._write_lock = asyncio.Lock()
         self._close_callbacks: list[ConnectionClosedCallback] = []
         self._closed = False
+        self._trace_emitter = trace_emitter
+        self.client_identity = _client_identity(writer.get_extra_info("peername"))
 
     def add_close_callback(self, callback: ConnectionClosedCallback) -> None:
         if self._closed:
@@ -54,6 +75,7 @@ class TCPConnection:
         async with self._write_lock:
             self._writer.write(to_ndjson(model))
             await self._writer.drain()
+        self._trace_write(model)
 
     async def write_notification(self, notification: JsonRpcNotification) -> None:
         await self.write_notifications([notification])
@@ -88,6 +110,27 @@ class TCPConnection:
         with suppress(Exception):
             await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
 
+    def _trace_write(self, model: BaseModel) -> None:
+        self._submit_trace(
+            TraceRecord(
+                ts=_now(),
+                direction="CORE→CLIENT",
+                layer="ipc",
+                kind="error" if isinstance(model, JsonRpcErrorResponse) else "response",
+                client_id=self.client_identity,
+                data=model.model_dump(mode="json"),
+            )
+        )
+
+    def _submit_trace(self, record: TraceRecord) -> None:
+        if self._trace_emitter is None:
+            return
+
+        try:
+            self._trace_emitter.emit(record)
+        except Exception:
+            logger.exception("failed to emit socket trace")
+
 
 def current_tcp_connection() -> TCPConnection:
     """Return the TCP connection currently dispatching this request."""
@@ -108,11 +151,13 @@ class TCPServer:
         *,
         max_request_bytes: int,
         logger: logging.Logger | None = None,
+        trace_emitter: TraceEmitter | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.max_request_bytes = max_request_bytes
         self.logger = logger or logging.getLogger(__name__)
+        self._trace_emitter = trace_emitter
         self.routes: dict[str, RouteHandler] = {}
         self._server: asyncio.Server | None = None
         self._connection_tasks: set[asyncio.Task[None]] = set()
@@ -185,7 +230,7 @@ class TCPServer:
             self._connection_tasks.add(task)
 
         peer = writer.get_extra_info("peername")
-        connection = TCPConnection(writer)
+        connection = TCPConnection(writer, trace_emitter=self._trace_emitter)
         self.logger.debug("client connected: %s", peer)
 
         try:
@@ -194,16 +239,16 @@ class TCPServer:
                     line = await reader.readuntil(b"\n")
                 except asyncio.IncompleteReadError as error:
                     if len(error.partial) > self.max_request_bytes:
-                        await self._write_response(writer, self._request_too_large_error())
+                        await connection.write_model(self._request_too_large_error())
                     elif error.partial:
-                        await self._write_response(writer, self._incomplete_request_error())
+                        await connection.write_model(self._incomplete_request_error())
                     break
                 except asyncio.LimitOverrunError:
-                    await self._write_response(writer, self._request_too_large_error())
+                    await connection.write_model(self._request_too_large_error())
                     break
 
                 if len(line) > self.max_request_bytes:
-                    await self._write_response(writer, self._request_too_large_error())
+                    await connection.write_model(self._request_too_large_error())
                     break
 
                 response = await self.dispatch(line, connection)
@@ -235,6 +280,8 @@ class TCPServer:
                 data=error.errors(),
             )
 
+        self._trace_command_received(request, connection, byte_count=len(line))
+
         try:
             handler = self.routes.get(request.method)
             if handler is None:
@@ -265,10 +312,6 @@ class TCPServer:
                 data={"error": str(error)},
             )
 
-    async def _write_response(self, writer: asyncio.StreamWriter, response: JsonRpcReply) -> None:
-        writer.write(to_ndjson(response))
-        await writer.drain()
-
     def _request_too_large_error(self) -> JsonRpcErrorResponse:
         return make_error_response(
             None,
@@ -283,9 +326,50 @@ class TCPServer:
             "request must be newline-delimited JSON",
         )
 
+    def _trace_command_received(
+        self,
+        request: JsonRpcRequest,
+        connection: TCPConnection,
+        *,
+        byte_count: int,
+    ) -> None:
+        if self._trace_emitter is None:
+            return
+
+        record = TraceRecord(
+            ts=_now(),
+            direction="CLIENT→CORE",
+            layer="ipc",
+            kind="command",
+            client_id=connection.client_identity,
+            data={
+                "method": request.method,
+                "id": request.id,
+                "params": request.params,
+                "bytes": byte_count,
+            },
+        )
+        try:
+            self._trace_emitter.emit(record)
+        except Exception:
+            self.logger.exception("failed to emit socket trace")
+
 
 def _request_validation_error_code(error: ValidationError) -> JsonRpcErrorCode:
     for item in error.errors():
         if item.get("loc") == ("json",) and "Invalid JSON" in str(item.get("msg", "")):
             return JsonRpcErrorCode.PARSE_ERROR
     return JsonRpcErrorCode.INVALID_REQUEST
+
+
+def _client_identity(peer: Any) -> str:
+    if peer is None:
+        return "unknown"
+    if isinstance(peer, tuple):
+        if len(peer) >= 2:
+            return f"{peer[0]}:{peer[1]}"
+        if peer:
+            return str(peer[0])
+
+    return str(peer)
+

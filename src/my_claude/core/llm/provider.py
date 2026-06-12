@@ -72,7 +72,10 @@ class AnthropicStreamingProvider:
         self,
         messages: Sequence[AnthropicMessage],
         tools: Sequence[ToolDefinition],
+        *,
+        step: int | None = None,
     ) -> LLMResponse:
+        del step
         kwargs: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": self._config.max_tokens,

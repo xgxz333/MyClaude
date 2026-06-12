@@ -17,12 +17,17 @@ from my_claude.llm.client import LLMResponse
 class ScriptedLLMClient:
     def __init__(self, responses: Sequence[LLMResponse]) -> None:
         self._responses = list(responses)
+        self.steps: list[int | None] = []
 
     async def complete(
         self,
         messages: Sequence[AnthropicMessage],
         tools: Sequence[ToolDefinition],
+        *,
+        step: int | None = None,
     ) -> LLMResponse:
+        del messages, tools
+        self.steps.append(step)
         if not self._responses:
             raise RuntimeError("no scripted llm response left")
         return self._responses.pop(0)

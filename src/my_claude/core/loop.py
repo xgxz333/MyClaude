@@ -131,7 +131,11 @@ class AgentLoop:
                 tools=len(tools),
             )
         )
-        return await self._llm_client.complete(messages, tools)
+        return await self._llm_client.complete(
+            messages,
+            tools,
+            step=self._working_memory.step,
+        )
 
     async def _act(self, tool_uses: list[ToolUseBlock]) -> None:
         for tool_use in tool_uses:

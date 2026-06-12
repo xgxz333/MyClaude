@@ -45,6 +45,7 @@ from my_claude.core.runner import (
     run_goal,
     run_prepared_context,
 )
+from my_claude.core.trace.writer import TraceWriter
 from my_claude.core.transport.socket_client import SocketClient
 from my_claude.core.transport.socket_server import RouteHandler, TCPServer
 from my_claude.llm.client import (
@@ -82,6 +83,20 @@ def test_run_command_accepts_goal(
     assert "[run] success  1 steps" in captured.out
 
 
+def test_daemon_writes_all_layers_to_shared_trace_channel(tmp_path: Path) -> None:
+    records = asyncio.run(_run_via_test_daemon_with_shared_trace_writer("write tests", tmp_path))
+
+    layers = {record["layer"] for record in records}
+    directions = {record["direction"] for record in records}
+    kinds = {record["kind"] for record in records}
+
+    assert "ipc" in layers
+    assert "event" in layers
+    assert "llm" in layers
+    assert {"CLIENT→CORE", "CORE→CLIENT", "CORE", "CORE→LLM", "LLM→CORE"} <= directions
+    assert {"command", "response", "push", "event", "api_call", "api_response"} <= kinds
+
+
 def test_agent_run_route_returns_run_id_before_background_run_finishes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -93,7 +108,9 @@ def test_agent_run_route_returns_run_id_before_background_run_finishes(
     assert result["accepted"] is True
     assert result["run_id"]
     assert result["goal"] == "write tests"
-    assert result["timeline_path"].endswith("events.jsonl")
+    timeline_path = result["timeline_path"]
+    assert isinstance(timeline_path, str)
+    assert timeline_path.endswith("events.jsonl")
     assert background_started is True
     assert background_finished is False
 
@@ -110,7 +127,9 @@ async def _agent_run_returns_before_background_finish(
         context: RunContext,
         *,
         listeners: Sequence[object] = (),
+        trace_writer: object | None = None,
     ) -> RunResult:
+        del trace_writer
         nonlocal finished
         started.set()
         await release.wait()
@@ -147,6 +166,75 @@ async def _agent_run_returns_before_background_finish(
         await server.shutdown()
 
 
+def test_agent_run_route_passes_shared_trace_writer_to_background_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    assert asyncio.run(_agent_run_uses_shared_trace_writer(monkeypatch, tmp_path))
+
+
+async def _agent_run_uses_shared_trace_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> bool:
+    seen_trace_writer: object | None = None
+
+    async def recording_run_prepared_context(
+        context: RunContext,
+        *,
+        listeners: Sequence[object] = (),
+        trace_writer: object | None = None,
+    ) -> RunResult:
+        del listeners
+        nonlocal seen_trace_writer
+        seen_trace_writer = trace_writer
+        return RunResult(
+            run_id=context.run_id,
+            run_dir=context.run_dir,
+            timeline_path=context.timeline_path,
+            agent_result=AgentResult(
+                goal=context.working_memory.goal,
+                final_response="done",
+            ),
+        )
+
+    monkeypatch.setattr(
+        app_module,
+        "run_prepared_context",
+        recording_run_prepared_context,
+    )
+
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    trace_writer = TraceWriter(tmp_path / "daemon.jsonl")
+    server = TCPServer(
+        "127.0.0.1",
+        0,
+        max_request_bytes=config.max_request_bytes,
+        trace_emitter=trace_writer,
+    )
+    register_routes(
+        server,
+        config=config,
+        server_version="test-version",
+        trace_writer=trace_writer,
+    )
+    await trace_writer.start()
+    await server.start()
+
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            await client.request(AGENT_RUN_METHOD, {"goal": "write tests"})
+            await asyncio.sleep(0)
+            return seen_trace_writer is trace_writer and server._trace_emitter is trace_writer
+    finally:
+        await server.shutdown()
+        await trace_writer.stop()
+
+
 async def _run_via_test_daemon(goal: str, tmp_path: Path) -> tuple[int, list[str]]:
     config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
     server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
@@ -179,6 +267,46 @@ async def _run_via_test_daemon(goal: str, tmp_path: Path) -> tuple[int, list[str
         return exit_code, methods
     finally:
         await server.shutdown()
+
+
+async def _run_via_test_daemon_with_shared_trace_writer(
+    goal: str,
+    tmp_path: Path,
+) -> list[dict[str, object]]:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    trace_path = tmp_path / "daemon.jsonl"
+    trace_writer = TraceWriter(trace_path)
+    server = TCPServer(
+        "127.0.0.1",
+        0,
+        max_request_bytes=config.max_request_bytes,
+        trace_emitter=trace_writer,
+    )
+    register_routes(
+        server,
+        config=config,
+        server_version="test-version",
+        trace_writer=trace_writer,
+    )
+
+    await trace_writer.start()
+    await server.start()
+    try:
+        client_config = config.model_copy(
+            update={
+                "core_host": "127.0.0.1",
+                "core_port": _bound_port(server),
+            }
+        )
+        await _run_over_socket(goal, config=client_config, printer=StdoutPrinter())
+    finally:
+        await server.shutdown()
+        await trace_writer.stop()
+
+    return [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def _bound_port(server: TCPServer) -> int:
@@ -267,6 +395,7 @@ def test_prepare_run_context_assembles_runtime_before_agent_loop(tmp_path: Path)
     assert context.run_dir.exists()
     assert context.run_dir.parent == tmp_path / "runs"
     assert context.timeline_path == context.run_dir / "events.jsonl"
+    assert context.trace_path == context.run_dir / "trace.jsonl"
     assert context.working_memory.run_id == context.run_id
     assert context.working_memory.goal == "ship it"
     assert context.working_memory.max_steps == config.agent_max_iterations
@@ -298,6 +427,37 @@ def test_runner_writes_timeline_file(tmp_path: Path) -> None:
     ]
     assert events[0]["data"]["goal"] == "ship it"
     assert events[1]["data"]["step"] == 1
+
+
+def test_runner_writes_event_bus_trace_file(tmp_path: Path) -> None:
+    config = AppConfig(runs_dir=tmp_path / "runs")
+    result = asyncio.run(run_goal("ship it", config=config))
+    trace_path = result.run_dir / "trace.jsonl"
+
+    assert trace_path.exists()
+    records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    event_records = [record for record in records if record["layer"] == "event"]
+    llm_records = [record for record in records if record["layer"] == "llm"]
+
+    assert [record["data"]["type"] for record in event_records] == [
+        "run.started",
+        "step.started",
+        "llm.request_started",
+        "llm.response_completed",
+        "step.finished",
+        "run.finished",
+    ]
+    assert all(record["direction"] == "CORE" for record in event_records)
+    assert all(record["kind"] == "event" for record in event_records)
+    assert event_records[0]["data"]["goal"] == "ship it"
+    assert event_records[0]["data"]["run_id"] == result.run_id
+    assert [record["kind"] for record in llm_records] == ["api_call", "api_response"]
+    assert [record["step"] for record in llm_records] == [1, 1]
+    assert "messages" in llm_records[0]["data"]
+    assert "text" in llm_records[1]["data"]
 
 
 def test_prepared_runner_writes_timeline_and_broadcasts_events(tmp_path: Path) -> None:
@@ -362,7 +522,10 @@ def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
             self,
             messages: Sequence[AnthropicMessage],
             tools: Sequence[ToolDefinition],
+            *,
+            step: int | None = None,
         ) -> LLMResponse:
+            del messages, tools, step
             self._started.set()
             await asyncio.sleep(60)
             return LLMResponse(content="never")

@@ -27,6 +27,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ping_parser.add_argument("--timeout", type=float, help="Ping timeout in seconds.")
     run_parser = subparsers.add_parser("run", help="Run a goal.")
     run_parser.add_argument("--goal", required=True, help="Goal to run.")
+    trace_parser = subparsers.add_parser("trace", help="View system trace log.")
+    trace_parser.add_argument("run_id", nargs="?", default=None, help="Filter by run ID.")
+    trace_parser.add_argument("--run-id", dest="run_id_flag", help="Filter by run ID.")
+    trace_parser.add_argument("--path", help="Read trace records from this JSONL file.")
+    trace_parser.add_argument("--layer", choices=["ipc", "event", "llm"], help="Filter by layer.")
+    trace_parser.add_argument("--direction", help="Filter by direction, e.g. CORE→LLM.")
+    trace_parser.add_argument("--raw", action="store_true", help="Output raw NDJSON.")
+    trace_parser.add_argument("--follow", "-f", action="store_true", help="Follow new records.")
+    trace_parser.add_argument("--limit", type=int, help="Maximum number of records to show.")
+    trace_parser.add_argument("--json", action="store_true", help="Print raw JSONL records.")
     args = parser.parse_args(argv)
 
     if args.command == "ping":
@@ -37,6 +47,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from my_claude.cli.commands.run import main as run_main
 
         return run_main(args)
+    elif args.command == "trace":
+        from my_claude.cli.commands.trace import main as trace_main
+
+        return trace_main(args)
     else:
         parser.print_help()
 

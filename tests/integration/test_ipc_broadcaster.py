@@ -14,6 +14,7 @@ from my_claude.agent.events import (
 )
 from my_claude.core.bus.envelope import EventPushEnvelope
 from my_claude.core.events.writer import serialize_event
+from my_claude.core.trace import TraceRecord
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster, IpcEventConnection
 
 
@@ -52,6 +53,17 @@ class RecordingConnection:
         self._close_callbacks.clear()
         for callback in callbacks:
             callback()
+
+
+class RecordingTraceEmitter:
+    def __init__(self) -> None:
+        self.records: list[TraceRecord] = []
+        self.on_emit: Callable[[TraceRecord], None] | None = None
+
+    def emit(self, record: TraceRecord) -> None:
+        if self.on_emit is not None:
+            self.on_emit(record)
+        self.records.append(record)
 
 
 def test_ipc_broadcaster_filters_by_event_type_and_run_id() -> None:
@@ -175,6 +187,97 @@ def test_ipc_broadcaster_immediately_reclaims_already_closed_connection() -> Non
     broadcaster.subscribe(cast(IpcEventConnection, closed_connection))
 
     assert broadcaster.subscriber_count == 0
+
+
+def test_ipc_broadcaster_traces_successful_push_after_send_only() -> None:
+    trace = asyncio.run(_trace_successful_push())
+
+    assert len(trace.records) == 1
+    record = trace.records[0]
+    assert record.layer == "ipc"
+    assert record.direction == "CORE→CLIENT"
+    assert record.kind == "push"
+    assert record.run_id == "run-1"
+    assert record.data == {
+        "sub_id": record.data["sub_id"],
+        "event_type": "run.started",
+    }
+    assert "event" not in record.data
+    assert "goal" not in record.data
+    assert "run_id" not in record.data
+
+
+async def _trace_successful_push() -> RecordingTraceEmitter:
+    trace = RecordingTraceEmitter()
+    broadcaster = IpcEventBroadcaster(trace_emitter=trace)
+    connection = RecordingConnection()
+
+    def assert_sent_before_trace(record: TraceRecord) -> None:
+        assert len(connection.events) == 1
+        assert record.data["sub_id"] == subscription_id
+
+    trace.on_emit = assert_sent_before_trace
+    subscription_id = broadcaster.subscribe(cast(IpcEventConnection, connection))
+
+    await broadcaster.handle(RunStartedEvent(goal="first", run_id="run-1"))
+    return trace
+
+
+def test_ipc_broadcaster_does_not_trace_failed_push() -> None:
+    trace = asyncio.run(_skip_failed_push_trace())
+
+    assert trace.records == []
+
+
+async def _skip_failed_push_trace() -> RecordingTraceEmitter:
+    trace = RecordingTraceEmitter()
+    broadcaster = IpcEventBroadcaster(trace_emitter=trace)
+    broadcaster.subscribe(cast(IpcEventConnection, RecordingConnection(fail_on_write=True)))
+
+    await broadcaster.handle(RunStartedEvent(goal="first", run_id="run-1"))
+    return trace
+
+
+def test_ipc_broadcaster_traces_replay_pushes_after_batch_send(tmp_path: Path) -> None:
+    trace = asyncio.run(_trace_replay_pushes(tmp_path))
+
+    assert [record.data["sub_id"] for record in trace.records] == [
+        "history-replay",
+        "history-replay",
+    ]
+    assert [record.data["event_type"] for record in trace.records] == [
+        "step.started",
+        "run.finished",
+    ]
+    assert all(set(record.data) == {"sub_id", "event_type"} for record in trace.records)
+
+
+async def _trace_replay_pushes(tmp_path: Path) -> RecordingTraceEmitter:
+    trace = RecordingTraceEmitter()
+    runs_dir = tmp_path / "runs"
+    _write_history(
+        runs_dir,
+        "run-1",
+        [
+            RunStartedEvent(goal="first", run_id="run-1"),
+            StepStartedEvent(run_id="run-1", step=1),
+            RunCompletedEvent(goal="first", run_id="run-1"),
+        ],
+    )
+    connection = RecordingConnection()
+
+    def assert_batch_sent_before_trace(_record: TraceRecord) -> None:
+        assert connection.write_events_count == 1
+        assert len(connection.events) == 2
+
+    trace.on_emit = assert_batch_sent_before_trace
+    broadcaster = IpcEventBroadcaster(runs_dir, trace_emitter=trace)
+    await broadcaster.replay(
+        cast(IpcEventConnection, connection),
+        replay_from=2,
+        run_id="run-1",
+    )
+    return trace
 
 
 def _event_type(envelope: EventPushEnvelope) -> str:

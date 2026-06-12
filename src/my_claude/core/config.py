@@ -36,6 +36,9 @@ class AppConfig(BaseModel):
     llm_model: str = "claude-sonnet-4-6"
     llm_timeout_seconds: float = Field(default=30.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
+    trace_enabled: bool = True
+    trace_file: Path | None = None
+    trace_include_llm_payload: bool = True
 
 
 def load_config(
