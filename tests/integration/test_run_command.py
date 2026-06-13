@@ -5,7 +5,7 @@ import io
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -115,6 +115,23 @@ def test_agent_run_route_returns_run_id_before_background_run_finishes(
     assert background_finished is False
 
 
+def test_agent_run_route_accepts_concurrent_background_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first, second, started_count, remaining_tasks = asyncio.run(
+        _agent_run_accepts_concurrent_background_runs(monkeypatch, tmp_path)
+    )
+
+    assert first["accepted"] is True
+    assert second["accepted"] is True
+    assert first["run_id"] != second["run_id"]
+    assert first["goal"] == "first goal"
+    assert second["goal"] == "second goal"
+    assert started_count == 2
+    assert remaining_tasks == 0
+
+
 async def _agent_run_returns_before_background_finish(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -164,6 +181,63 @@ async def _agent_run_returns_before_background_finish(
         release.set()
         await asyncio.sleep(0)
         await server.shutdown()
+
+
+async def _agent_run_accepts_concurrent_background_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object], int, int]:
+    started_run_ids: list[str] = []
+    release = asyncio.Event()
+
+    async def slow_run_prepared_context(
+        context: RunContext,
+        *,
+        listeners: Sequence[object] = (),
+        trace_writer: object | None = None,
+    ) -> RunResult:
+        del listeners, trace_writer
+        started_run_ids.append(context.run_id)
+        await release.wait()
+        return RunResult(
+            run_id=context.run_id,
+            run_dir=context.run_dir,
+            timeline_path=context.timeline_path,
+            agent_result=AgentResult(
+                goal=context.working_memory.goal,
+                final_response="done",
+            ),
+        )
+
+    monkeypatch.setattr(app_module, "run_prepared_context", slow_run_prepared_context)
+
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    run_tasks: set[asyncio.Task[RunResult]] = set()
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(
+        server,
+        config=config,
+        server_version="test-version",
+        run_tasks=run_tasks,
+    )
+    await server.start()
+
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            first = await client.request(AGENT_RUN_METHOD, {"goal": " first goal "})
+            second = await client.request(AGENT_RUN_METHOD, {"goal": "second goal"})
+            await _wait_until(lambda: len(started_run_ids) == 2)
+    finally:
+        release.set()
+        if run_tasks:
+            await asyncio.gather(*tuple(run_tasks), return_exceptions=True)
+        await server.shutdown()
+
+    return first, second, len(started_run_ids), len(run_tasks)
 
 
 def test_agent_run_route_passes_shared_trace_writer_to_background_run(
@@ -316,6 +390,18 @@ def _bound_port(server: TCPServer) -> int:
     return int(server._server.sockets[0].getsockname()[1])
 
 
+async def _wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout_seconds: float = 1.0,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("condition was not met before timeout")
+        await asyncio.sleep(0)
+
+
 def test_config_accepts_anthropic_env_aliases(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -394,6 +480,9 @@ def test_prepare_run_context_assembles_runtime_before_agent_loop(tmp_path: Path)
     assert context.run_id
     assert context.run_dir.exists()
     assert context.run_dir.parent == tmp_path / "runs"
+    assert context.workspace_dir == context.run_dir
+    assert context.tasks_dir == context.run_dir / ".tasks"
+    assert context.tasks_dir.exists()
     assert context.timeline_path == context.run_dir / "events.jsonl"
     assert context.trace_path == context.run_dir / "trace.jsonl"
     assert context.working_memory.run_id == context.run_id
@@ -404,7 +493,16 @@ def test_prepare_run_context_assembles_runtime_before_agent_loop(tmp_path: Path)
     assert context.working_memory.messages[0].role == "user"
     assert isinstance(context.working_memory.messages[0].content[0], TextBlock)
     assert context.working_memory.messages[0].content[0].text == "ship it"
-    assert [definition.name for definition in context.tools.definitions()] == ["read_file"]
+    assert [definition.name for definition in context.tools.definitions()] == [
+        "read_file",
+        "write_file",
+        "list_dir",
+        "bash",
+        "task_create",
+        "task_update",
+        "task_list",
+        "task_get",
+    ]
     assert context.loop_controller.should_continue()
 
 

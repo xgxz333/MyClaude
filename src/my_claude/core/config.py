@@ -34,7 +34,7 @@ class AppConfig(BaseModel):
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1/responses"
     llm_model: str = "claude-sonnet-4-6"
-    llm_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_timeout_seconds: float = Field(default=120.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
     trace_enabled: bool = True
     trace_file: Path | None = None

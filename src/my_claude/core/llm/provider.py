@@ -43,7 +43,7 @@ class AnthropicProviderConfig:
     api_key: str
     model: str
     base_url: str = "https://api.anthropic.com/v1/messages"
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 120.0
     max_tokens: int = 1024
 
 

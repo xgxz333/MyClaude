@@ -9,8 +9,8 @@ from typing import Any
 
 from my_claude.core.tools.base import ToolDefinition, ToolResult
 
-DEFAULT_MAX_BYTES = 64 * 1024
-DEFAULT_MAX_CHARS = 16 * 1024
+DEFAULT_MAX_BYTES = 512 * 1024
+DEFAULT_MAX_CHARS = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ class ReadFileTool:
         root = self.root.resolve()
 
         try:
-            path = _resolve_safe_path(root, requested_path)
+            path = resolve_safe_path(root, requested_path)
         except ValueError as error:
             return ToolResult.failure(str(error))
 
@@ -73,12 +73,12 @@ class ReadFileTool:
             decoded = decoded[:max_chars]
 
         if truncated_by_bytes or truncated_by_chars:
-            decoded += "\n\n[read_file truncated]"
+            decoded += "\n[truncated]"
 
         return ToolResult.success(decoded)
 
 
-def _resolve_safe_path(root: Path, requested_path: str) -> Path:
+def resolve_safe_path(root: Path, requested_path: str) -> Path:
     if "\x00" in requested_path:
         raise ValueError("path contains null byte")
 

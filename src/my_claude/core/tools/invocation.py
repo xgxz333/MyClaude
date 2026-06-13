@@ -25,8 +25,20 @@ class ToolInvoker:
         if validation_error is not None:
             return ToolResult.failure(validation_error, error_type="schema_error")
 
+        task = asyncio.create_task(tool.run(arguments))
         try:
-            return await asyncio.wait_for(tool.run(arguments), timeout=self.timeout_seconds)
+            done, _pending = await asyncio.wait({task}, timeout=self.timeout_seconds)
+            if task not in done:
+                task.cancel()
+                await _wait_for_cancelled_tool(task)
+                return ToolResult.failure(
+                    f"tool timed out after {self.timeout_seconds:.2f}s",
+                    error_type="timeout",
+                )
+            return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
         except TimeoutError:
             return ToolResult.failure(
                 f"tool timed out after {self.timeout_seconds:.2f}s",
@@ -102,3 +114,23 @@ def _matches_json_schema_type(value: Any, expected_type: str) -> bool:
         return value is None
 
     return True
+
+
+async def _wait_for_cancelled_tool(task: asyncio.Task[ToolResult]) -> None:
+    try:
+        await asyncio.wait_for(task, timeout=0.5)
+    except TimeoutError:
+        task.add_done_callback(_consume_tool_result)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
+def _consume_tool_result(task: asyncio.Task[ToolResult]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return

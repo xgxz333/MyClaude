@@ -25,7 +25,17 @@ from my_claude.agent.tools import ToolRegistry
 from my_claude.core.config import AppConfig
 from my_claude.core.events.bus import EventBus
 from my_claude.core.events.writer import JsonlEventWriter
-from my_claude.core.tools.builtin.read_file import ReadFileTool
+from my_claude.core.task.manager import TaskManager
+from my_claude.core.tools.builtin import (
+    BashTool,
+    ListDirTool,
+    ReadFileTool,
+    TaskCreateTool,
+    TaskGetTool,
+    TaskListTool,
+    TaskUpdateTool,
+    WriteFileTool,
+)
 from my_claude.core.trace.provider import EventBusTracingProvider, TracingProvider
 from my_claude.core.trace.writer import TraceWriter
 from my_claude.llm.client import create_llm_client
@@ -39,6 +49,8 @@ class RunContext:
 
     run_id: str
     run_dir: Path
+    workspace_dir: Path
+    tasks_dir: Path
     timeline_path: Path
     trace_path: Path
     config: AppConfig
@@ -56,6 +68,51 @@ class RunResult:
     run_dir: Path
     timeline_path: Path
     agent_result: AgentResult
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """Kama-style captured run outcome returned by AgentRunner."""
+
+    status: str
+    result: str
+    reason: str | None
+
+
+class AgentRunner:
+    """Convenience runner that prepares a run sandbox and captures the final result."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        listeners: Sequence[EventHandler] = (),
+        trace_writer: TraceWriter | None = None,
+    ) -> None:
+        self._config = config
+        self._listeners = tuple(listeners)
+        self._trace_writer = trace_writer
+
+    async def run(self, goal: str, *, run_id: str | None = None) -> None:
+        await self.run_and_capture(goal, run_id=run_id)
+
+    async def run_and_capture(
+        self,
+        goal: str,
+        *,
+        run_id: str | None = None,
+    ) -> RunOutcome:
+        context = prepare_run_context(goal, config=self._config, run_id=run_id)
+        result = await run_prepared_context(
+            context,
+            listeners=self._listeners,
+            trace_writer=self._trace_writer,
+        )
+        return RunOutcome(
+            status=context.working_memory.status.value,
+            result=result.agent_result.final_response,
+            reason=context.working_memory.reason,
+        )
 
 
 async def run_goal(
@@ -135,8 +192,9 @@ def prepare_run_context(
     *,
     config: AppConfig,
     listeners: Sequence[EventHandler] = (),
+    run_id: str | None = None,
 ) -> RunContext:
-    run_id = new_run_id()
+    run_id = run_id or new_run_id()
     run_dir = config.runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -144,7 +202,10 @@ def prepare_run_context(
     for listener in listeners:
         event_bus.subscribe(listener)
 
-    tools = ToolRegistry([ReadFileTool(root=Path.cwd())])
+    workspace_dir = run_dir
+    tasks_dir = workspace_dir / ".tasks"
+    task_manager = TaskManager(tasks_dir)
+    tools = _build_registry(task_manager, workspace_root=Path.cwd())
     loop_controller = LoopController(max_iterations=config.agent_max_iterations)
     working_memory = WorkingMemory.from_goal(
         goal,
@@ -156,6 +217,8 @@ def prepare_run_context(
     return RunContext(
         run_id=run_id,
         run_dir=run_dir,
+        workspace_dir=workspace_dir,
+        tasks_dir=tasks_dir,
         timeline_path=timeline_path,
         trace_path=trace_path,
         config=config,
@@ -163,6 +226,28 @@ def prepare_run_context(
         working_memory=working_memory,
         tools=tools,
         loop_controller=loop_controller,
+    )
+
+
+def _build_registry(
+    task_manager: TaskManager,
+    *,
+    workspace_root: Path,
+) -> ToolRegistry:
+    """Build the agent toolbox with one shared task manager instance."""
+
+    return ToolRegistry(
+        [
+            ReadFileTool(root=workspace_root),
+            WriteFileTool(root=workspace_root),
+            ListDirTool(root=workspace_root),
+            BashTool(cwd=workspace_root),
+            TaskCreateTool(task_manager),
+            TaskUpdateTool(task_manager),
+            TaskListTool(task_manager),
+            TaskGetTool(task_manager),
+        ],
+        timeout_seconds=130.0,
     )
 
 

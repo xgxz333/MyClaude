@@ -7,8 +7,10 @@ import asyncio
 import logging
 import signal
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
+from my_claude.agent.events import EventHandler
 from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
     CORE_PING_METHOD,
@@ -25,7 +27,12 @@ from my_claude.core.bus.command import (
 from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.logging_setup import setup_logging
-from my_claude.core.runner import RunResult, prepare_run_context, run_prepared_context
+from my_claude.core.runner import (
+    RunContext,
+    RunResult,
+    prepare_run_context,
+    run_prepared_context,
+)
 from my_claude.core.trace.paths import DAEMON_TRACE_FILENAME
 from my_claude.core.trace.writer import TraceWriter
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -92,20 +99,16 @@ def register_routes(
         if not isinstance(command, AgentRunCommand):
             raise ValueError("agent.run params are invalid")
 
-        if any(not task.done() for task in active_run_tasks):
-            raise RuntimeError("a run is already in progress")
+        goal = command.params.goal.strip()
+        if not goal:
+            raise ValueError("agent.run goal must not be empty")
 
-        context = prepare_run_context(command.params.goal, config=runtime_config)
-        run_task = asyncio.create_task(
-            run_prepared_context(
-                context,
-                listeners=[event_broadcaster.handle],
-                trace_writer=trace_emitter,
-            )
-        )
-        active_run_tasks.add(run_task)
-        run_task.add_done_callback(
-            lambda task: _finish_background_run(task, active_run_tasks)
+        context = prepare_run_context(goal, config=runtime_config)
+        _schedule_background_run(
+            context,
+            listeners=[event_broadcaster.handle],
+            trace_writer=trace_emitter,
+            run_tasks=active_run_tasks,
         )
         return AgentRunResult(
             run_id=context.run_id,
@@ -118,18 +121,49 @@ def register_routes(
     server.register(AGENT_RUN_METHOD, handle_agent_run)
 
 
+def _schedule_background_run(
+    context: RunContext,
+    *,
+    listeners: Sequence[EventHandler],
+    trace_writer: TraceWriter | None,
+    run_tasks: set[asyncio.Task[RunResult]],
+) -> None:
+    run_task = asyncio.create_task(
+        run_prepared_context(
+            context,
+            listeners=listeners,
+            trace_writer=trace_writer,
+        ),
+        name=f"myclaude-run-{context.run_id}",
+    )
+    run_tasks.add(run_task)
+    run_task.add_done_callback(
+        lambda task: _finish_background_run(
+            task,
+            run_tasks,
+            run_id=context.run_id,
+        )
+    )
+    logger.info("accepted agent run: run_id=%s", context.run_id)
+
+
 def _finish_background_run(
     task: asyncio.Task[RunResult],
     run_tasks: set[asyncio.Task[RunResult]],
+    *,
+    run_id: str | None = None,
 ) -> None:
     run_tasks.discard(task)
     if task.cancelled():
+        logger.info("background agent run cancelled: run_id=%s", run_id or "<unknown>")
         return
 
     try:
-        task.result()
+        result = task.result()
     except Exception:
-        logger.exception("background agent run failed")
+        logger.exception("background agent run failed: run_id=%s", run_id or "<unknown>")
+    else:
+        logger.info("background agent run finished: run_id=%s", result.run_id)
 
 
 async def _cancel_background_runs(

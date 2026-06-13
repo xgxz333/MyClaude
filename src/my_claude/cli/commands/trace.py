@@ -236,6 +236,7 @@ def _summarize(record: TraceRecord) -> str:
         usage = data.get("usage", {})
         output_tokens = usage.get("output_tokens", "?") if isinstance(usage, dict) else "?"
         return (
+            f"stop={data.get('stop_reason')}  "
             f"latency={data.get('latency_ms')}ms  "
             f"out_tokens={output_tokens}"
         )

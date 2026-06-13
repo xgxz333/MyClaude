@@ -42,7 +42,7 @@ def test_read_file_tool_truncates_output_by_character_limit(tmp_path: Path) -> N
 
     result = asyncio.run(tool.run({"path": "large.txt"}))
 
-    assert result.content == "abcd\n\n[read_file truncated]"
+    assert result.content == "abcd\n[truncated]"
 
 
 def test_read_file_tool_decodes_invalid_utf8_with_replacement(tmp_path: Path) -> None:
