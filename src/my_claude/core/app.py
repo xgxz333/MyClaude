@@ -10,29 +10,47 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from my_claude.agent.events import EventHandler
+from my_claude.agent.events import AgentEvent, EventHandler
 from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
     CORE_PING_METHOD,
     EVENT_SUBSCRIBE_METHOD,
+    SESSION_CLOSE_METHOD,
+    SESSION_CREATE_METHOD,
+    SESSION_GET_HISTORY_METHOD,
+    SESSION_MESSAGE_METHOD,
+    SESSION_SEND_MESSAGE_METHOD,
     AgentRunCommand,
     AgentRunResult,
     BusResult,
     EventSubscribeCommand,
     EventSubscribeResult,
+    SessionCloseCommand,
+    SessionCloseResult,
+    SessionCreateCommand,
+    SessionCreateResult,
+    SessionGetHistoryCommand,
+    SessionGetHistoryResult,
+    SessionMessageCommand,
+    SessionMessageResult,
+    SessionSendMessageCommand,
+    SessionSendMessageResult,
     command_from_request,
     get_server_version,
     ping_result,
 )
 from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
+from my_claude.core.events.bus import EventBus
 from my_claude.core.logging_setup import setup_logging
 from my_claude.core.runner import (
     RunContext,
     RunResult,
+    new_run_id,
     prepare_run_context,
     run_prepared_context,
 )
+from my_claude.core.session import SessionManager, SessionMessageOutcome
 from my_claude.core.trace.paths import DAEMON_TRACE_FILENAME
 from my_claude.core.trace.writer import TraceWriter
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -58,7 +76,10 @@ def register_routes(
         runtime_config.runs_dir,
         trace_emitter=trace_emitter,
     )
+    daemon_event_bus: EventBus[AgentEvent] = EventBus()
+    daemon_event_bus.subscribe(event_broadcaster.handle)
     active_run_tasks: set[asyncio.Task[RunResult]] = run_tasks if run_tasks is not None else set()
+    session_manager = SessionManager(runtime_config.runs_dir, daemon_event_bus)
 
     async def handle_core_ping(_request: JsonRpcRequest) -> BusResult:
         return ping_result(
@@ -103,12 +124,21 @@ def register_routes(
         if not goal:
             raise ValueError("agent.run goal must not be empty")
 
-        context = prepare_run_context(goal, config=runtime_config)
-        _schedule_background_run(
+        message_outcome, context = await _prepare_one_shot_session_run(
+            goal,
+            session_manager=session_manager,
+            config=runtime_config,
+        )
+        run_task = _schedule_background_run(
             context,
             listeners=[event_broadcaster.handle],
             trace_writer=trace_emitter,
             run_tasks=active_run_tasks,
+        )
+        _persist_session_result_when_done(
+            run_task,
+            session_manager=session_manager,
+            message_outcome=message_outcome,
         )
         return AgentRunResult(
             run_id=context.run_id,
@@ -116,9 +146,165 @@ def register_routes(
             timeline_path=str(context.timeline_path),
         )
 
+    async def handle_session_create(request: JsonRpcRequest) -> BusResult:
+        return await _session_create_handler(
+            request,
+            session_manager=session_manager,
+        )
+
+    async def handle_session_message(request: JsonRpcRequest) -> BusResult:
+        command = command_from_request(request)
+        if not isinstance(command, SessionMessageCommand):
+            raise ValueError("session.message params are invalid")
+
+        run_id = new_run_id()
+        message_outcome = await session_manager.start_message(
+            session_id=command.params.session_id,
+            message=command.params.message,
+            run_id=run_id,
+        )
+        context = prepare_run_context(
+            message_outcome.execution_context.goal,
+            config=runtime_config,
+            execution_context=message_outcome.execution_context,
+        )
+        run_task = _schedule_background_run(
+            context,
+            listeners=[event_broadcaster.handle],
+            trace_writer=trace_emitter,
+            run_tasks=active_run_tasks,
+        )
+        _persist_session_result_when_done(
+            run_task,
+            session_manager=session_manager,
+            message_outcome=message_outcome,
+        )
+        return SessionMessageResult(
+            session_id=message_outcome.session.session_id,
+            turn=message_outcome.turn,
+            run_id=context.run_id,
+            timeline_path=str(context.timeline_path),
+        )
+
+    async def handle_session_send_message(request: JsonRpcRequest) -> BusResult:
+        command = command_from_request(request)
+        if not isinstance(command, SessionSendMessageCommand):
+            raise ValueError("session.send_message params are invalid")
+
+        run_id = new_run_id()
+        message_outcome = await session_manager.start_message(
+            session_id=command.params.session_id,
+            message=command.params.content,
+            run_id=run_id,
+        )
+        context = prepare_run_context(
+            message_outcome.execution_context.goal,
+            config=runtime_config,
+            execution_context=message_outcome.execution_context,
+        )
+        run_task = _schedule_background_run(
+            context,
+            listeners=[event_broadcaster.handle],
+            trace_writer=trace_emitter,
+            run_tasks=active_run_tasks,
+        )
+        try:
+            await run_task
+        finally:
+            await session_manager.finish_message(
+                session_id=message_outcome.session.session_id,
+                task=run_task,
+                prefill_messages=message_outcome.prefill_messages,
+            )
+        return SessionSendMessageResult(run_id=context.run_id)
+
+    async def handle_session_get_history(request: JsonRpcRequest) -> BusResult:
+        command = command_from_request(request)
+        if not isinstance(command, SessionGetHistoryCommand):
+            raise ValueError("session.get_history params are invalid")
+
+        return SessionGetHistoryResult(
+            messages=await session_manager.get_history(command.params.session_id)
+        )
+
+    async def handle_session_close(request: JsonRpcRequest) -> BusResult:
+        command = command_from_request(request)
+        if not isinstance(command, SessionCloseCommand):
+            raise ValueError("session.close params are invalid")
+
+        await session_manager.close(command.params.session_id)
+        return SessionCloseResult()
+
     server.register(CORE_PING_METHOD, handle_core_ping)
     server.register(EVENT_SUBSCRIBE_METHOD, handle_event_subscribe)
     server.register(AGENT_RUN_METHOD, handle_agent_run)
+    server.register(SESSION_CREATE_METHOD, handle_session_create)
+    server.register(SESSION_MESSAGE_METHOD, handle_session_message)
+    server.register(SESSION_SEND_MESSAGE_METHOD, handle_session_send_message)
+    server.register(SESSION_GET_HISTORY_METHOD, handle_session_get_history)
+    server.register(SESSION_CLOSE_METHOD, handle_session_close)
+
+
+async def _prepare_one_shot_session_run(
+    goal: str,
+    *,
+    session_manager: SessionManager,
+    config: AppConfig,
+) -> tuple[SessionMessageOutcome, RunContext]:
+    """Adapt legacy `agent.run` requests onto the session-backed execution path."""
+
+    run_id = new_run_id()
+    create_outcome = await session_manager.create(mode="one_shot", title=goal[:40])
+    message_outcome = await session_manager.start_message(
+        session_id=create_outcome.session.session_id,
+        message=goal,
+        run_id=run_id,
+    )
+    context = prepare_run_context(
+        message_outcome.execution_context.goal,
+        config=config,
+        execution_context=message_outcome.execution_context,
+    )
+    return message_outcome, context
+
+
+def _persist_session_result_when_done(
+    run_task: asyncio.Task[RunResult],
+    *,
+    session_manager: SessionManager,
+    message_outcome: SessionMessageOutcome,
+) -> None:
+    run_task.add_done_callback(
+        lambda task: asyncio.create_task(
+            session_manager.finish_message(
+                session_id=message_outcome.session.session_id,
+                task=task,
+                prefill_messages=message_outcome.prefill_messages,
+            )
+        )
+    )
+
+
+async def _session_create_handler(
+    request: JsonRpcRequest,
+    *,
+    session_manager: SessionManager,
+) -> BusResult:
+    command = command_from_request(request)
+    if not isinstance(command, SessionCreateCommand):
+        raise ValueError("session.create params are invalid")
+
+    outcome = await session_manager.create(
+        mode=command.params.mode,
+        title=command.params.title,
+    )
+    session = outcome.session
+    logger.info("created chat session: session_id=%s path=%s", session.session_id, outcome.path)
+    return SessionCreateResult(
+        session_id=session.session_id,
+        status=session.status,
+        title=session.title,
+    )
 
 
 def _schedule_background_run(
@@ -127,7 +313,7 @@ def _schedule_background_run(
     listeners: Sequence[EventHandler],
     trace_writer: TraceWriter | None,
     run_tasks: set[asyncio.Task[RunResult]],
-) -> None:
+) -> asyncio.Task[RunResult]:
     run_task = asyncio.create_task(
         run_prepared_context(
             context,
@@ -145,6 +331,7 @@ def _schedule_background_run(
         )
     )
     logger.info("accepted agent run: run_id=%s", context.run_id)
+    return run_task
 
 
 def _finish_background_run(

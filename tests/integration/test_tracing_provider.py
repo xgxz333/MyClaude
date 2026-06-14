@@ -100,6 +100,7 @@ def test_llm_tracing_provider_records_request_and_response_without_full_payload(
     assert request.run_id == "run-1"
     assert request.step == 2
     assert request.data == {
+        "has_system_prompt_patch": False,
         "message_count": 1,
         "tool_count": 1,
     }
@@ -195,7 +196,8 @@ class StaticLLMClient:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
-        del messages, tools
+        del messages, tools, system_prompt_patch
         StaticLLMClient.last_step = step
         return self._response

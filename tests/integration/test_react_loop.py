@@ -18,6 +18,7 @@ class ScriptedLLMClient:
     def __init__(self, responses: Sequence[LLMResponse]) -> None:
         self._responses = list(responses)
         self.steps: list[int | None] = []
+        self.system_prompt_patches: list[str | None] = []
 
     async def complete(
         self,
@@ -25,9 +26,11 @@ class ScriptedLLMClient:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
         del messages, tools
         self.steps.append(step)
+        self.system_prompt_patches.append(system_prompt_patch)
         if not self._responses:
             raise RuntimeError("no scripted llm response left")
         return self._responses.pop(0)
@@ -99,6 +102,22 @@ def test_react_loop_observes_tool_calls_acts_then_terminates() -> None:
         AgentEventType.RUN_COMPLETED,
     ]
     assert events[0].data == {"run_id": "run-1", "step": 1}
+
+
+def test_react_loop_passes_system_prompt_patch_to_llm() -> None:
+    client = ScriptedLLMClient([LLMResponse(content="done")])
+    memory = WorkingMemory.from_goal("ship it", run_id="run-1", max_steps=1)
+    memory.system_prompt_patch = "Long-term session notes:\n- fact: repo uses uv"
+    loop = AgentLoop(
+        llm_client=client,
+        tools=ToolRegistry(),
+        working_memory=memory,
+        loop_controller=LoopController(max_iterations=1),
+    )
+
+    asyncio.run(loop.run())
+
+    assert client.system_prompt_patches == ["Long-term session notes:\n- fact: repo uses uv"]
 
 
 def test_react_loop_marks_memory_cancelled_when_external_cancel_is_requested() -> None:

@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,12 +23,15 @@ from my_claude.agent.events import (
 from my_claude.agent.memory import RunStatus, WorkingMemory
 from my_claude.agent.tools import ToolRegistry
 from my_claude.core.config import AppConfig
+from my_claude.core.context import AnthropicMessage, ExecutionContext
 from my_claude.core.events.bus import EventBus
 from my_claude.core.events.writer import JsonlEventWriter
 from my_claude.core.task.manager import TaskManager
+from my_claude.core.tools.base import BaseTool
 from my_claude.core.tools.builtin import (
     BashTool,
     ListDirTool,
+    NoteSaveTool,
     ReadFileTool,
     TaskCreateTool,
     TaskGetTool,
@@ -68,6 +71,7 @@ class RunResult:
     run_dir: Path
     timeline_path: Path
     agent_result: AgentResult
+    messages: list[AnthropicMessage] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -168,6 +172,7 @@ async def run_prepared_context(
         run_dir=context.run_dir,
         timeline_path=context.timeline_path,
         agent_result=agent_result,
+        messages=context.working_memory.llm_messages(),
     )
 
 
@@ -193,9 +198,14 @@ def prepare_run_context(
     config: AppConfig,
     listeners: Sequence[EventHandler] = (),
     run_id: str | None = None,
+    execution_context: ExecutionContext | None = None,
 ) -> RunContext:
-    run_id = run_id or new_run_id()
-    run_dir = config.runs_dir / run_id
+    if execution_context is not None:
+        run_id = execution_context.run_id
+    else:
+        run_id = run_id or new_run_id()
+        execution_context = ExecutionContext.isolated(goal=goal, run_id=run_id)
+    run_dir = _run_dir_for_execution_context(config, execution_context)
     run_dir.mkdir(parents=True, exist_ok=False)
 
     event_bus: EventBus[AgentEvent] = EventBus()
@@ -205,11 +215,15 @@ def prepare_run_context(
     workspace_dir = run_dir
     tasks_dir = workspace_dir / ".tasks"
     task_manager = TaskManager(tasks_dir)
-    tools = _build_registry(task_manager, workspace_root=Path.cwd())
-    loop_controller = LoopController(max_iterations=config.agent_max_iterations)
-    working_memory = WorkingMemory.from_goal(
-        goal,
+    tools = _build_registry(
+        task_manager,
+        workspace_root=Path.cwd(),
+        notes_path=_notes_path_for_execution_context(config, execution_context),
         run_id=run_id,
+    )
+    loop_controller = LoopController(max_iterations=config.agent_max_iterations)
+    working_memory = WorkingMemory.from_execution_context(
+        execution_context,
         max_steps=config.agent_max_iterations,
     )
     timeline_path = run_dir / "events.jsonl"
@@ -233,21 +247,55 @@ def _build_registry(
     task_manager: TaskManager,
     *,
     workspace_root: Path,
+    notes_path: Path | None = None,
+    run_id: str | None = None,
 ) -> ToolRegistry:
     """Build the agent toolbox with one shared task manager instance."""
 
-    return ToolRegistry(
-        [
-            ReadFileTool(root=workspace_root),
-            WriteFileTool(root=workspace_root),
-            ListDirTool(root=workspace_root),
-            BashTool(cwd=workspace_root),
-            TaskCreateTool(task_manager),
-            TaskUpdateTool(task_manager),
-            TaskListTool(task_manager),
-            TaskGetTool(task_manager),
-        ],
-        timeout_seconds=130.0,
+    tools: list[BaseTool] = [
+        ReadFileTool(root=workspace_root),
+        WriteFileTool(root=workspace_root),
+        ListDirTool(root=workspace_root),
+        BashTool(cwd=workspace_root),
+        TaskCreateTool(task_manager),
+        TaskUpdateTool(task_manager),
+        TaskListTool(task_manager),
+        TaskGetTool(task_manager),
+    ]
+    if notes_path is not None:
+        session_id = notes_path.parent.name
+        tools.append(
+            NoteSaveTool(
+                session_id=session_id,
+                notes_path=notes_path,
+                run_id=run_id or "manual",
+            )
+        )
+
+    return ToolRegistry(tools, timeout_seconds=130.0)
+
+
+def _notes_path_for_execution_context(
+    config: AppConfig,
+    execution_context: ExecutionContext,
+) -> Path | None:
+    if execution_context.session_id is None:
+        return None
+    return config.runs_dir / "sessions" / execution_context.session_id / "notes.md"
+
+
+def _run_dir_for_execution_context(
+    config: AppConfig,
+    execution_context: ExecutionContext,
+) -> Path:
+    if execution_context.session_id is None:
+        return config.runs_dir / execution_context.run_id
+    return (
+        config.runs_dir
+        / "sessions"
+        / execution_context.session_id
+        / "runs"
+        / execution_context.run_id
     )
 
 

@@ -59,10 +59,16 @@ class TracingProvider:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
-        self._emit_request(messages, tools, step=step)
+        self._emit_request(messages, tools, step=step, system_prompt_patch=system_prompt_patch)
         started_at = time.monotonic()
-        response = await self._provider.complete(messages, tools, step=step)
+        response = await self._provider.complete(
+            messages,
+            tools,
+            step=step,
+            system_prompt_patch=system_prompt_patch,
+        )
         latency_ms = int((time.monotonic() - started_at) * 1000)
         self._emit_response(response, step=step, latency_ms=latency_ms)
         return response
@@ -73,15 +79,18 @@ class TracingProvider:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None,
+        system_prompt_patch: str | None,
     ) -> None:
         data: dict[str, Any]
         if self._include_payload:
             data = {
+                "system_prompt_patch": system_prompt_patch,
                 "messages": [_message_payload(message) for message in messages],
                 "tool_schemas": [_tool_schema_payload(tool) for tool in tools],
             }
         else:
             data = {
+                "has_system_prompt_patch": bool(system_prompt_patch),
                 "message_count": len(messages),
                 "tool_count": len(tools),
             }

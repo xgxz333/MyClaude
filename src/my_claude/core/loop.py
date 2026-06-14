@@ -72,6 +72,7 @@ class AgentLoop:
                 last_response = response.content
                 await self._emit(
                     LLMResponseCompletedEvent(
+                        run_id=self._working_memory.run_id,
                         message=response.content,
                         content=response.content,
                         has_raw_response=response.raw is not None,
@@ -127,6 +128,7 @@ class AgentLoop:
         tools = self._tools.definitions()
         await self._emit(
             LLMRequestStartedEvent(
+                run_id=self._working_memory.run_id,
                 model_input_messages=len(messages),
                 tools=len(tools),
             )
@@ -135,6 +137,7 @@ class AgentLoop:
             messages,
             tools,
             step=self._working_memory.step,
+            system_prompt_patch=self._working_memory.system_prompt_patch,
         )
 
     async def _act(self, tool_uses: list[ToolUseBlock]) -> None:

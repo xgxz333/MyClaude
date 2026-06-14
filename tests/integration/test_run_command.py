@@ -36,7 +36,13 @@ from my_claude.core.app import register_routes
 from my_claude.core.bus.command import AGENT_RUN_METHOD, EVENT_SUBSCRIBE_METHOD, BusResult
 from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
-from my_claude.core.context import AnthropicMessage
+from my_claude.core.context import (
+    AnthropicMessage,
+    ExecutionContext,
+    ExecutionMode,
+    SemanticMemoryItem,
+    SemanticMemoryKind,
+)
 from my_claude.core.events.bus import EventBus
 from my_claude.core.runner import (
     RunContext,
@@ -130,6 +136,24 @@ def test_agent_run_route_accepts_concurrent_background_runs(
     assert second["goal"] == "second goal"
     assert started_count == 2
     assert remaining_tasks == 0
+
+
+def test_agent_run_route_uses_one_shot_session_adapter(tmp_path: Path) -> None:
+    result, session_payload = asyncio.run(_agent_run_persists_one_shot_session(tmp_path))
+    turns = cast(list[dict[str, object]], session_payload["turns"])
+
+    assert result["accepted"] is True
+    assert session_payload["title"] == "explain the adapter"
+    assert session_payload["mode"] == "one_shot"
+    assert session_payload["status"] == "closed"
+    assert session_payload["run_ids"] == [result["run_id"]]
+    assert [turn["role"] for turn in turns] == ["user", "assistant"]
+    assert turns[0]["content"] == "explain the adapter"
+    assert turns[0]["run_id"] == result["run_id"]
+    assistant_content = cast(list[dict[str, object]], turns[1]["content"])
+    assistant_text = cast(str, assistant_content[0]["text"])
+    assert "Local LLM placeholder accepted goal: explain the adapter" in assistant_text
+    assert "Registered tools: 9" in assistant_text
 
 
 async def _agent_run_returns_before_background_finish(
@@ -238,6 +262,50 @@ async def _agent_run_accepts_concurrent_background_runs(
         await server.shutdown()
 
     return first, second, len(started_run_ids), len(run_tasks)
+
+
+async def _agent_run_persists_one_shot_session(
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(server, config=config, server_version="test-version")
+    await server.start()
+
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            result = await client.request(
+                AGENT_RUN_METHOD,
+                {"goal": "explain the adapter"},
+            )
+
+            def one_shot_session_written() -> bool:
+                session_files = list((config.runs_dir / "sessions").glob("sess-*/meta.json"))
+                if len(session_files) != 1:
+                    return False
+                payload = json.loads(session_files[0].read_text(encoding="utf-8"))
+                thread_path = session_files[0].with_name("thread.jsonl")
+                if payload.get("status") != "closed" or not thread_path.exists():
+                    return False
+                turns = thread_path.read_text(encoding="utf-8").splitlines()
+                return len(turns) == 2
+
+            await _wait_until(one_shot_session_written)
+            session_file = next((config.runs_dir / "sessions").glob("sess-*/meta.json"))
+            payload = json.loads(session_file.read_text(encoding="utf-8"))
+            payload["turns"] = [
+                json.loads(line)
+                for line in session_file.with_name("thread.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            return result, payload
+    finally:
+        await server.shutdown()
 
 
 def test_agent_run_route_passes_shared_trace_writer_to_background_run(
@@ -506,6 +574,42 @@ def test_prepare_run_context_assembles_runtime_before_agent_loop(tmp_path: Path)
     assert context.loop_controller.should_continue()
 
 
+def test_prepare_run_context_accepts_session_execution_context(tmp_path: Path) -> None:
+    config = AppConfig(runs_dir=tmp_path / "runs")
+    execution_context = ExecutionContext(
+        mode=ExecutionMode.SESSION,
+        run_id="run-session",
+        goal="latest question",
+        session_id="sess-1",
+        episodic_messages=[
+            AnthropicMessage.user_text("earlier question"),
+            AnthropicMessage.assistant_text("earlier answer"),
+            AnthropicMessage.user_text("latest question"),
+        ],
+        semantic_memory=[
+            SemanticMemoryItem(
+                kind=SemanticMemoryKind.DECISION,
+                content="use busy errors",
+            )
+        ],
+    )
+
+    context = prepare_run_context(
+        "ignored when execution context is supplied",
+        config=config,
+        execution_context=execution_context,
+    )
+
+    assert context.run_id == "run-session"
+    assert context.working_memory.goal == "latest question"
+    assert context.working_memory.system_prompt_patch is not None
+    assert context.working_memory.system_prompt_patch.startswith("## Session Notes")
+    assert "decision: use busy errors" in context.working_memory.system_prompt_patch
+    assert context.working_memory.messages[0].text == "earlier question"
+    assert context.working_memory.messages[-1].text == "latest question"
+    assert [definition.name for definition in context.tools.definitions()][-1] == "note_save"
+
+
 def test_runner_writes_timeline_file(tmp_path: Path) -> None:
     config = AppConfig(runs_dir=tmp_path / "runs")
     result = asyncio.run(run_goal("ship it", config=config))
@@ -622,8 +726,9 @@ def test_runner_marks_broadcasts_logs_closes_and_reraises_on_cancel(
             tools: Sequence[ToolDefinition],
             *,
             step: int | None = None,
+            system_prompt_patch: str | None = None,
         ) -> LLMResponse:
-            del messages, tools, step
+            del messages, tools, step, system_prompt_patch
             self._started.set()
             await asyncio.sleep(60)
             return LLMResponse(content="never")

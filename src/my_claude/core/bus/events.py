@@ -25,6 +25,11 @@ class AgentEventType(StrEnum):
     RUN_COMPLETED = "run.finished"
     RUN_CANCELLED = "run.cancelled"
     RUN_FAILED = "run.failed"
+    SESSION_CREATED = "session.created"
+    SESSION_MESSAGE_RECEIVED = "session.message_received"
+    SESSION_WAITING_FOR_INPUT = "session.waiting_for_input"
+    SESSION_RESUMED = "session.resumed"
+    SESSION_CLOSED = "session.closed"
 
 
 class AgentEvent(BaseModel):
@@ -76,6 +81,7 @@ class LLMRequestStartedEvent(AgentEvent):
 
     type: Literal[AgentEventType.LLM_REQUEST_STARTED] = AgentEventType.LLM_REQUEST_STARTED
     message: str = "llm request started"
+    run_id: str | None = None
     model_input_messages: int
     tools: int
 
@@ -116,6 +122,7 @@ class LLMResponseCompletedEvent(AgentEvent):
     """Event emitted after the LLM has returned a complete response."""
 
     type: Literal[AgentEventType.LLM_RESPONSE_COMPLETED] = AgentEventType.LLM_RESPONSE_COMPLETED
+    run_id: str | None = None
     content: str
     has_raw_response: bool = False
 
@@ -174,6 +181,56 @@ class RunFailedEvent(AgentEvent):
     run_id: str | None = None
 
 
+class SessionCreatedEvent(AgentEvent):
+    """Event emitted when the daemon creates a chat session."""
+
+    type: Literal[AgentEventType.SESSION_CREATED] = AgentEventType.SESSION_CREATED
+    message: str = "session created"
+    session_id: str
+    mode: str = "chat"
+    status: str = "active"
+    title: str | None = None
+    path: str
+
+
+class SessionMessageReceivedEvent(AgentEvent):
+    """Event emitted after a user message is appended to a session thread."""
+
+    type: Literal[AgentEventType.SESSION_MESSAGE_RECEIVED] = (
+        AgentEventType.SESSION_MESSAGE_RECEIVED
+    )
+    message: str = "session message received"
+    session_id: str
+    content: str
+
+
+class SessionWaitingForInputEvent(AgentEvent):
+    """Event emitted when a chat session finishes a turn and waits for input."""
+
+    type: Literal[AgentEventType.SESSION_WAITING_FOR_INPUT] = (
+        AgentEventType.SESSION_WAITING_FOR_INPUT
+    )
+    message: str = "session waiting for input"
+    session_id: str
+    last_run_id: str
+
+
+class SessionResumedEvent(AgentEvent):
+    """Event emitted when a waiting chat session accepts another message."""
+
+    type: Literal[AgentEventType.SESSION_RESUMED] = AgentEventType.SESSION_RESUMED
+    message: str = "session resumed"
+    session_id: str
+
+
+class SessionClosedEvent(AgentEvent):
+    """Event emitted when a session is closed."""
+
+    type: Literal[AgentEventType.SESSION_CLOSED] = AgentEventType.SESSION_CLOSED
+    message: str = "session closed"
+    session_id: str
+
+
 KnownAgentEvent = (
     RunStartedEvent
     | StepStartedEvent
@@ -188,6 +245,11 @@ KnownAgentEvent = (
     | RunCompletedEvent
     | RunCancelledEvent
     | RunFailedEvent
+    | SessionCreatedEvent
+    | SessionMessageReceivedEvent
+    | SessionWaitingForInputEvent
+    | SessionResumedEvent
+    | SessionClosedEvent
 )
 
 KnownAgentEventAdapter: TypeAdapter[KnownAgentEvent] = TypeAdapter(KnownAgentEvent)

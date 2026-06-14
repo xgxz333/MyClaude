@@ -14,6 +14,11 @@ CORE_PING_METHOD: Literal["core.ping"] = "core.ping"
 EVENT_SUBSCRIBE_METHOD: Literal["event.subscribe"] = "event.subscribe"
 EVENT_PUBLISH_METHOD: Literal["event.publish"] = "event.publish"
 AGENT_RUN_METHOD: Literal["agent.run"] = "agent.run"
+SESSION_CREATE_METHOD: Literal["session.create"] = "session.create"
+SESSION_MESSAGE_METHOD: Literal["session.message"] = "session.message"
+SESSION_SEND_MESSAGE_METHOD: Literal["session.send_message"] = "session.send_message"
+SESSION_GET_HISTORY_METHOD: Literal["session.get_history"] = "session.get_history"
+SESSION_CLOSE_METHOD: Literal["session.close"] = "session.close"
 PACKAGE_NAME = "MyClaude"
 FALLBACK_VERSION = "0.1.0"
 
@@ -103,12 +108,173 @@ class AgentRunResult(BaseModel):
     timeline_path: str
 
 
-BusCommand = CorePingCommand | EventSubscribeCommand | AgentRunCommand
-BusResult = CorePingResult | EventSubscribeResult | AgentRunResult
+class SessionCreateParams(BaseModel):
+    """Parameters for creating a daemon-side chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["one_shot", "chat"] = "chat"
+    title: str | None = Field(default=None, min_length=1)
+
+
+class SessionCreateCommand(BaseModel):
+    """Command envelope for creating a daemon-side chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.create"] = SESSION_CREATE_METHOD
+    params: SessionCreateParams = Field(default_factory=SessionCreateParams)
+
+
+class SessionCreateResult(BaseModel):
+    """Result returned after creating a daemon-side chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    status: Literal["active", "waiting_for_input", "closed"] = "active"
+    title: str | None = None
+
+
+class SessionMessageParams(BaseModel):
+    """Parameters for sending one user message to an existing chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
+
+class SessionMessageCommand(BaseModel):
+    """Command envelope for sending one user message to a chat session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.message"] = SESSION_MESSAGE_METHOD
+    params: SessionMessageParams
+
+
+class SessionSendMessageParams(BaseModel):
+    """Kama-compatible parameters for sending one user message to a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class SessionSendMessageCommand(BaseModel):
+    """Kama-compatible command envelope for sending one user message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.send_message"] = SESSION_SEND_MESSAGE_METHOD
+    params: SessionSendMessageParams
+
+
+class SessionMessageResult(BaseModel):
+    """Result returned immediately after the daemon accepts a chat message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: Literal[True] = True
+    session_id: str
+    turn: int
+    run_id: str
+    timeline_path: str
+
+
+class SessionSendMessageResult(BaseModel):
+    """Kama-compatible result returned after a session message run completes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+
+
+class SessionGetHistoryParams(BaseModel):
+    """Parameters for reading a session's complete conversation thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+
+
+class SessionGetHistoryCommand(BaseModel):
+    """Command envelope for reading a session's complete conversation thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.get_history"] = SESSION_GET_HISTORY_METHOD
+    params: SessionGetHistoryParams
+
+
+class SessionGetHistoryResult(BaseModel):
+    """Result returned with Anthropic-compatible session messages."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[dict[str, Any]]
+
+
+class SessionCloseParams(BaseModel):
+    """Parameters for closing a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+
+
+class SessionCloseCommand(BaseModel):
+    """Command envelope for closing a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.close"] = SESSION_CLOSE_METHOD
+    params: SessionCloseParams
+
+
+class SessionCloseResult(BaseModel):
+    """Result returned after closing a session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["closed"] = "closed"
+
+
+BusCommand = (
+    CorePingCommand
+    | EventSubscribeCommand
+    | AgentRunCommand
+    | SessionCreateCommand
+    | SessionMessageCommand
+    | SessionSendMessageCommand
+    | SessionGetHistoryCommand
+    | SessionCloseCommand
+)
+BusResult = (
+    CorePingResult
+    | EventSubscribeResult
+    | AgentRunResult
+    | SessionCreateResult
+    | SessionMessageResult
+    | SessionSendMessageResult
+    | SessionGetHistoryResult
+    | SessionCloseResult
+)
 
 
 def command_from_request(request: JsonRpcRequest) -> BusCommand:
-    if request.method not in {CORE_PING_METHOD, EVENT_SUBSCRIBE_METHOD, AGENT_RUN_METHOD}:
+    if request.method not in {
+        CORE_PING_METHOD,
+        EVENT_SUBSCRIBE_METHOD,
+        AGENT_RUN_METHOD,
+        SESSION_CREATE_METHOD,
+        SESSION_MESSAGE_METHOD,
+        SESSION_SEND_MESSAGE_METHOD,
+        SESSION_GET_HISTORY_METHOD,
+        SESSION_CLOSE_METHOD,
+    }:
         raise ValueError(f"unknown command method: {request.method}")
 
     params = request.params if request.params is not None else {}
@@ -120,6 +286,16 @@ def command_from_request(request: JsonRpcRequest) -> BusCommand:
         return CorePingCommand.model_validate(payload)
     if request.method == EVENT_SUBSCRIBE_METHOD:
         return EventSubscribeCommand.model_validate(payload)
+    if request.method == SESSION_CREATE_METHOD:
+        return SessionCreateCommand.model_validate(payload)
+    if request.method == SESSION_MESSAGE_METHOD:
+        return SessionMessageCommand.model_validate(payload)
+    if request.method == SESSION_SEND_MESSAGE_METHOD:
+        return SessionSendMessageCommand.model_validate(payload)
+    if request.method == SESSION_GET_HISTORY_METHOD:
+        return SessionGetHistoryCommand.model_validate(payload)
+    if request.method == SESSION_CLOSE_METHOD:
+        return SessionCloseCommand.model_validate(payload)
 
     return AgentRunCommand.model_validate(payload)
 

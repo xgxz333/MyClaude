@@ -48,6 +48,7 @@ class LLMClient(Protocol):
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse: ...
 
 
@@ -60,8 +61,9 @@ class LocalLLMClient:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
-        del step
+        del step, system_prompt_patch
         user_messages = [_message_text(message) for message in messages if message.role == "user"]
         goal = user_messages[-1] if user_messages else ""
         tool_count = len(tools)
@@ -88,14 +90,21 @@ class OpenAICompatibleLLMClient:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
         del step
-        return await asyncio.to_thread(self._complete_blocking, messages, tools)
+        return await asyncio.to_thread(
+            self._complete_blocking,
+            messages,
+            tools,
+            system_prompt_patch,
+        )
 
     def _complete_blocking(
         self,
         messages: Sequence[LLMMessage],
         tools: Sequence[ToolDefinition],
+        system_prompt_patch: str | None,
     ) -> LLMResponse:
         payload = {
             "model": self.model,
@@ -110,6 +119,9 @@ class OpenAICompatibleLLMClient:
                 for message in messages
             ],
         }
+        instructions = _system_instructions(system_prompt_patch)
+        if instructions is not None:
+            payload["instructions"] = instructions
         if tools:
             payload["tools"] = [_tool_to_openai_payload(tool) for tool in tools]
 
@@ -177,6 +189,15 @@ def create_llm_client(
         base_url=config.llm_base_url,
         timeout_seconds=config.llm_timeout_seconds,
     )
+
+
+def _system_instructions(system_prompt_patch: str | None) -> str | None:
+    if system_prompt_patch is None:
+        return None
+    patch = system_prompt_patch.strip()
+    if not patch:
+        return None
+    return patch
 
 
 def _anthropic_messages_url(base_url: str) -> str:

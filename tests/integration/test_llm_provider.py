@@ -25,6 +25,7 @@ from my_claude.core.llm.provider import (
 
 def test_provider_adds_cache_control_to_system_and_tool_anchors() -> None:
     system = _system_payload()
+    patched_system = _system_payload("Long-term session notes:\n- fact: repo uses uv")
     messages = _messages_payload([AnthropicMessage.user_text("ship it")])
     tools = _tools_payload(
         [
@@ -37,6 +38,9 @@ def test_provider_adds_cache_control_to_system_and_tool_anchors() -> None:
     )
 
     assert system[-1]["cache_control"] == {"type": "ephemeral"}
+    assert patched_system[0]["text"].startswith("You are a helpful AI assistant")
+    assert patched_system[1]["text"] == "Long-term session notes:\n- fact: repo uses uv"
+    assert patched_system[-1]["cache_control"] == {"type": "ephemeral"}
     assert messages[-1]["content"] == "ship it"
     assert tools[-1]["cache_control"] == {"type": "ephemeral"}
 
@@ -103,6 +107,7 @@ def test_provider_uses_anthropic_sdk_stream_and_parses_final_message() -> None:
                     input_schema={"type": "object", "properties": {}},
                 )
             ],
+            system_prompt_patch="Long-term session notes:\n- fact: repo uses uv",
         )
     )
 
@@ -110,6 +115,7 @@ def test_provider_uses_anthropic_sdk_stream_and_parses_final_message() -> None:
     assert kwargs["model"] == "claude-test"
     assert kwargs["max_tokens"] == 256
     assert kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert kwargs["system"][-1]["text"] == "Long-term session notes:\n- fact: repo uses uv"
     assert kwargs["messages"][0]["role"] == "user"
     assert kwargs["messages"][0]["content"] == "ship it"
     assert kwargs["tools"][0]["name"] == "echo"

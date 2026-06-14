@@ -74,12 +74,13 @@ class AnthropicStreamingProvider:
         tools: Sequence[ToolDefinition],
         *,
         step: int | None = None,
+        system_prompt_patch: str | None = None,
     ) -> LLMResponse:
         del step
         kwargs: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": self._config.max_tokens,
-            "system": _system_payload(),
+            "system": _system_payload(system_prompt_patch),
             "messages": _messages_payload(messages),
         }
         if tools:
@@ -251,14 +252,23 @@ def _messages_payload(messages: Sequence[AnthropicMessage]) -> list[dict[str, An
     ]
 
 
-def _system_payload() -> list[dict[str, Any]]:
-    return [
+def _system_payload(system_prompt_patch: str | None = None) -> list[dict[str, Any]]:
+    system_blocks: list[dict[str, Any]] = [
         {
             "type": "text",
             "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
         }
     ]
+    patch = (system_prompt_patch or "").strip()
+    if patch:
+        system_blocks.append(
+            {
+                "type": "text",
+                "text": patch,
+            }
+        )
+    system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    return system_blocks
 
 
 def _message_content_payload(message: AnthropicMessage) -> str | list[dict[str, Any]]:

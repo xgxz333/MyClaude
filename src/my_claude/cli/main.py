@@ -27,6 +27,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ping_parser.add_argument("--timeout", type=float, help="Ping timeout in seconds.")
     run_parser = subparsers.add_parser("run", help="Run a goal.")
     run_parser.add_argument("--goal", required=True, help="Goal to run.")
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Open an interactive chat session.",
+        description="Open an interactive chat session.",
+    )
+    chat_parser.add_argument("--host", help="Core TCP host.")
+    chat_parser.add_argument("--port", type=int, help="Core TCP port.")
+    chat_parser.add_argument("--timeout", type=float, help="IPC timeout in seconds.")
+    chat_parser.add_argument("--session-id", help="Attach to an existing daemon chat session.")
+    chat_parser.add_argument("--title", help="Title for a new chat session.")
     trace_parser = subparsers.add_parser("trace", help="View system trace log.")
     trace_parser.add_argument("run_id", nargs="?", default=None, help="Filter by run ID.")
     trace_parser.add_argument("--run-id", dest="run_id_flag", help="Filter by run ID.")
@@ -47,6 +57,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from my_claude.cli.commands.run import main as run_main
 
         return run_main(args)
+    elif args.command == "chat":
+        from my_claude.cli.commands.chat import main as chat_main
+
+        return chat_main(args)
     elif args.command == "trace":
         from my_claude.cli.commands.trace import main as trace_main
 

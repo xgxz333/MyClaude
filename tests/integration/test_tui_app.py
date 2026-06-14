@@ -18,9 +18,10 @@ from my_claude.tui.app import LLMStreamBlock, MyClaudeTui, ToolCallBlock
 
 def test_tui_accumulates_streaming_llm_tokens_in_place() -> None:
     app = RenderlessTui()
+    app._mark_turn_running("run-1")
 
-    app._write_event(LLMTokenEvent(token="hello"))
-    app._write_event(LLMTokenEvent(token=" world"))
+    app._write_event(LLMTokenEvent(token="hello", run_id="run-1"))
+    app._write_event(LLMTokenEvent(token=" world", run_id="run-1"))
 
     assert len(app.mounted_widgets) == 1
     block = app.mounted_widgets[0]
@@ -30,8 +31,9 @@ def test_tui_accumulates_streaming_llm_tokens_in_place() -> None:
 
 def test_tui_uses_completed_response_when_no_tokens_arrived() -> None:
     app = RenderlessTui()
+    app._mark_turn_running("run-1")
 
-    app._write_event(LLMResponseCompletedEvent(content="final answer"))
+    app._write_event(LLMResponseCompletedEvent(content="final answer", run_id="run-1"))
 
     assert len(app.mounted_widgets) == 1
     block = app.mounted_widgets[0]
@@ -39,8 +41,22 @@ def test_tui_uses_completed_response_when_no_tokens_arrived() -> None:
     assert block.text == "final answer"
 
 
+def test_tui_does_not_duplicate_completed_response_after_streaming_tokens() -> None:
+    app = RenderlessTui()
+    app._mark_turn_running("run-1")
+
+    app._write_event(LLMTokenEvent(token="final", run_id="run-1"))
+    app._write_event(LLMResponseCompletedEvent(content="final answer", run_id="run-1"))
+
+    assert len(app.mounted_widgets) == 1
+    block = app.mounted_widgets[0]
+    assert isinstance(block, LLMStreamBlock)
+    assert block.text == "final"
+
+
 def test_tui_renders_run_step_and_usage_like_kama() -> None:
     app = RenderlessTui()
+    app._mark_turn_running("run-1")
 
     app._write_event(RunStartedEvent(goal="ship it", run_id="run-1"))
     app._write_event(StepStartedEvent(run_id="run-1", step=2))
@@ -62,11 +78,58 @@ def test_tui_renders_run_step_and_usage_like_kama() -> None:
     ]
 
 
+def test_tui_ignores_events_from_other_runs() -> None:
+    app = RenderlessTui()
+    app._mark_turn_running("run-1")
+
+    app._write_event(RunStartedEvent(goal="other", run_id="run-2"))
+    app._write_event(LLMTokenEvent(token="external", run_id="run-2"))
+    app._write_event(RunCompletedEvent(goal="other", run_id="run-2", steps=1))
+
+    assert app.mounted_widgets == []
+    assert app._active_run_id == "run-1"
+
+
+def test_tui_replays_early_events_after_session_message_is_accepted() -> None:
+    app = RenderlessTui()
+    app._awaiting_message_result = True
+
+    app._write_event(RunStartedEvent(goal="ship it", run_id="run-1"))
+    app._write_event(LLMTokenEvent(token="early", run_id="run-1"))
+
+    assert app.mounted_widgets == []
+
+    app._awaiting_message_result = False
+    app._mark_turn_running("run-1")
+
+    assert len(app.mounted_widgets) == 2
+    block = app.mounted_widgets[1]
+    assert isinstance(block, LLMStreamBlock)
+    assert block.text == "early"
+
+
+def test_tui_unlocks_message_input_after_active_session_run_finishes() -> None:
+    app = RenderlessTui()
+
+    app._mark_turn_running("run-1")
+    app._write_event(RunCompletedEvent(goal="other", run_id="run-2", steps=1))
+
+    assert app._active_run_id == "run-1"
+    assert app.input_states[-1] == (True, "Waiting for run-1...", "Busy")
+
+    app._write_event(RunCompletedEvent(goal="ship it", run_id="run-1", steps=2))
+
+    assert app._active_run_id is None
+    assert app.input_states[-1] == (False, "Message", "Send")
+
+
 def test_tui_renders_tool_calls_as_collapsible_blocks_like_kama() -> None:
     app = RenderlessTui()
+    app._mark_turn_running("run-1")
 
     app._write_event(
         ToolCallStartedEvent(
+            run_id="run-1",
             tool_use_id="tool-1",
             tool_name="bash",
             arguments={"command": "echo hi"},
@@ -74,6 +137,7 @@ def test_tui_renders_tool_calls_as_collapsible_blocks_like_kama() -> None:
     )
     app._write_event(
         ToolCallCompletedEvent(
+            run_id="run-1",
             tool_use_id="tool-1",
             tool_name="bash",
             result="hi",
@@ -127,6 +191,7 @@ class RenderlessTui(MyClaudeTui):
     def __init__(self) -> None:
         super().__init__()
         self.mounted_widgets: list[Widget] = []
+        self.input_states: list[tuple[bool, str, str]] = []
 
     @property
     def static_texts(self) -> list[str]:
@@ -138,3 +203,12 @@ class RenderlessTui(MyClaudeTui):
 
     def _append(self, widget: Widget) -> None:
         self.mounted_widgets.append(widget)
+
+    def _set_input_state(
+        self,
+        *,
+        disabled: bool,
+        placeholder: str,
+        button_label: str,
+    ) -> None:
+        self.input_states.append((disabled, placeholder, button_label))

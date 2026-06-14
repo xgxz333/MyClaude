@@ -12,16 +12,35 @@ from pydantic import ValidationError
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static
 
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
 from my_claude.core.bus.command import (
-    AGENT_RUN_METHOD,
     EVENT_SUBSCRIBE_METHOD,
+    SESSION_CLOSE_METHOD,
+    SESSION_CREATE_METHOD,
+    SESSION_SEND_MESSAGE_METHOD,
 )
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.transport.socket_client import SocketClient, SocketClientError
+
+RUN_SCOPED_EVENT_TYPES = {
+    AgentEventType.RUN_STARTED.value,
+    AgentEventType.STEP_STARTED.value,
+    AgentEventType.STEP_FINISHED.value,
+    AgentEventType.LLM_REQUEST_STARTED.value,
+    AgentEventType.LLM_TOKEN.value,
+    AgentEventType.LLM_USAGE.value,
+    AgentEventType.LLM_MODEL_SELECTED.value,
+    AgentEventType.LLM_RESPONSE_COMPLETED.value,
+    AgentEventType.TOOL_CALL_STARTED.value,
+    AgentEventType.TOOL_CALL_COMPLETED.value,
+    AgentEventType.RUN_COMPLETED.value,
+    AgentEventType.RUN_CANCELLED.value,
+    AgentEventType.RUN_FAILED.value,
+}
 
 
 class LLMStreamBlock(Static):
@@ -131,8 +150,9 @@ class MyClaudeTui(App[None]):
         width: 1fr;
     }
     #run-button {
-        width: 12;
+        width: 10;
     }
+    Static.user-message { color: $text; padding: 1 2 0 2; }
     Static.run-header { color: cyan; padding: 1 2 0 2; }
     Static.step-divider { color: $text-muted; padding: 0 2; }
     Static.run-ok { color: green; padding: 0 2 1 2; }
@@ -146,6 +166,10 @@ class MyClaudeTui(App[None]):
         self._config = config or load_config()
         self._client: SocketClient | None = None
         self._connected = asyncio.Event()
+        self._session_id: str | None = None
+        self._active_run_id: str | None = None
+        self._awaiting_message_result = False
+        self._pending_events_by_run: dict[str, list[Mapping[str, Any]]] = {}
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
 
@@ -153,8 +177,8 @@ class MyClaudeTui(App[None]):
         yield Label("[bold]MyClaude[/bold]  [dim]connecting...[/dim]", id="header")
         yield VerticalScroll(id="log-view")
         with Horizontal(id="command-bar"):
-            yield Input(placeholder="Goal", id="goal-input")
-            yield Button("Run", id="run-button", variant="primary")
+            yield Input(placeholder="Connecting...", id="goal-input", disabled=True)
+            yield Button("Send", id="run-button", variant="primary", disabled=True)
 
     def on_mount(self) -> None:
         self.run_worker(
@@ -163,20 +187,34 @@ class MyClaudeTui(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
+        self._set_waiting_for_connection()
         self.query_one("#goal-input", Input).focus()
+
+    async def on_unmount(self) -> None:
+        client = self._client
+        if client is None or self._session_id is None or not client.is_connected:
+            return
+        with suppress(SocketClientError):
+            await client.request(
+                SESSION_CLOSE_METHOD,
+                {"session_id": self._session_id},
+            )
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "run-button":
-            await self._submit_goal()
+            await self._submit_message()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "goal-input":
-            await self._submit_goal()
+            await self._submit_message()
 
     async def _submit_goal(self) -> None:
-        goal_input = self.query_one("#goal-input", Input)
-        goal = goal_input.value.strip()
-        if not goal:
+        await self._submit_message()
+
+    async def _submit_message(self) -> None:
+        message_input = self.query_one("#goal-input", Input)
+        message = message_input.value.strip()
+        if not message:
             return
 
         client = self._client
@@ -184,13 +222,35 @@ class MyClaudeTui(App[None]):
             self._append_log("ERROR", "tui", "daemon is not connected")
             return
 
-        try:
-            await client.request(AGENT_RUN_METHOD, {"goal": goal})
-        except SocketClientError as error:
-            self._append_log("ERROR", "tui", f"failed to start: {error}")
+        if self._session_id is None:
+            self._append_log("ERROR", "tui", "session is not ready")
             return
 
-        goal_input.value = ""
+        if self._active_run_id is not None:
+            self._append_log("WARNING", "tui", f"session is busy: {self._active_run_id}")
+            return
+
+        self._awaiting_message_result = True
+        self._set_input_state(
+            disabled=True,
+            placeholder="Sending...",
+            button_label="Busy",
+        )
+        try:
+            result = await client.request(
+                SESSION_SEND_MESSAGE_METHOD,
+                {"session_id": self._session_id, "content": message},
+            )
+        except SocketClientError as error:
+            self._awaiting_message_result = False
+            self._mark_turn_waiting()
+            self._append_log("ERROR", "tui", f"failed to send: {error}")
+            return
+
+        message_input.value = ""
+        self._append(Static(f"[bold]you[/bold]  {message}", classes="user-message"))
+        self._awaiting_message_result = False
+        self._mark_turn_running(str(result["run_id"]))
 
     async def _network_loop(self) -> None:
         retry_seconds = 1.0
@@ -213,6 +273,7 @@ class MyClaudeTui(App[None]):
                     EVENT_SUBSCRIBE_METHOD,
                     {
                         "topics": [
+                            "session.*",
                             "run.*",
                             "step.*",
                             "tool.*",
@@ -224,14 +285,18 @@ class MyClaudeTui(App[None]):
                         "scope": "global",
                     },
                 )
+                session_result = await client.request(SESSION_CREATE_METHOD, {})
+                self._session_id = str(session_result["session_id"])
 
                 self._client = client
                 self._connected.set()
                 retry_seconds = 1.0
                 header.update(
                     f"[bold]MyClaude[/bold]  "
-                    f"[dim]{self._config.core_host}:{self._config.core_port}[/dim]"
+                    f"[dim]{self._config.core_host}:{self._config.core_port}[/dim]  "
+                    f"[dim]{self._session_id}[/dim]"
                 )
+                self._mark_turn_waiting()
 
                 await client.wait_closed()
             except asyncio.CancelledError:
@@ -250,14 +315,19 @@ class MyClaudeTui(App[None]):
                 if self._client is client:
                     self._client = None
                 self._connected.clear()
+                self._session_id = None
+                self._active_run_id = None
+                self._awaiting_message_result = False
+                self._pending_events_by_run.clear()
                 self._break_llm()
+                self._set_waiting_for_connection()
                 header.update("[bold]MyClaude[/bold]  [dim]disconnected - retrying...[/dim]")
 
     async def _handle_event(self, event_payload: dict[str, Any]) -> None:
         try:
             event = KnownAgentEventAdapter.validate_python(event_payload)
         except ValidationError:
-            self._write_event_payload(event_payload)
+            self._receive_event_payload(event_payload)
             return
 
         self._write_event(event)
@@ -280,9 +350,19 @@ class MyClaudeTui(App[None]):
         )
 
     def _write_event(self, event: AgentEvent) -> None:
-        self._write_event_payload(event.model_dump(mode="json", exclude_none=True))
+        self._receive_event_payload(event.model_dump(mode="json", exclude_none=True))
 
-    def _write_event_payload(self, event: Mapping[str, Any]) -> None:
+    def _receive_event_payload(self, event: Mapping[str, Any]) -> None:
+        run_id = _run_id_from(event)
+        if run_id is not None and self._should_buffer_event(run_id):
+            self._pending_events_by_run.setdefault(run_id, []).append(event)
+            return
+        if not self._should_render_event(event):
+            return
+
+        self._render_event_payload(event)
+
+    def _render_event_payload(self, event: Mapping[str, Any]) -> None:
         event_type = str(event.get("type", ""))
 
         if event_type == AgentEventType.LLM_TOKEN:
@@ -292,6 +372,20 @@ class MyClaudeTui(App[None]):
                 self._append(llm_block)
                 self._current_llm = llm_block
             self._current_llm.append_token(token)
+            return
+
+        if event_type == AgentEventType.LLM_RESPONSE_COMPLETED:
+            content = str(event.get("content") or "")
+            current_llm = self._current_llm
+            if current_llm is not None and current_llm.text:
+                self._break_llm()
+                return
+            if content:
+                block = current_llm or LLMStreamBlock()
+                if current_llm is None:
+                    self._append(block)
+                block.append_token(content)
+            self._break_llm()
             return
 
         self._break_llm()
@@ -355,14 +449,17 @@ class MyClaudeTui(App[None]):
                 )
             else:
                 self._append_failed_run(reason=str(reason), steps=steps)
+            self._finish_active_turn_if_matching(event)
 
         elif event_type == AgentEventType.RUN_FAILED:
             reason = event.get("reason") or event.get("error") or ""
             self._append_failed_run(reason=str(reason), steps=event.get("steps", 0) or 0)
+            self._finish_active_turn_if_matching(event)
 
         elif event_type == AgentEventType.RUN_CANCELLED:
             reason = event.get("reason") or ""
             self._append_failed_run(reason=str(reason), steps=event.get("steps", 0) or 0)
+            self._finish_active_turn_if_matching(event)
 
         elif event_type == AgentEventType.LLM_USAGE:
             self._append(
@@ -374,13 +471,6 @@ class MyClaudeTui(App[None]):
                     classes="usage",
                 )
             )
-
-        elif event_type == AgentEventType.LLM_RESPONSE_COMPLETED:
-            content = str(event.get("content") or "")
-            if content:
-                block = LLMStreamBlock()
-                self._append(block)
-                block.append_token(content)
 
         elif event_type == "log.line":
             self._append_log(
@@ -398,9 +488,85 @@ class MyClaudeTui(App[None]):
             )
         )
 
+    def _mark_turn_running(self, run_id: str) -> None:
+        self._active_run_id = run_id
+        self._set_input_state(
+            disabled=True,
+            placeholder=f"Waiting for {run_id}...",
+            button_label="Busy",
+        )
+        self._replay_pending_events(run_id)
+
+    def _mark_turn_waiting(self) -> None:
+        self._active_run_id = None
+        self._set_input_state(
+            disabled=False,
+            placeholder="Message",
+            button_label="Send",
+        )
+
+    def _set_waiting_for_connection(self) -> None:
+        self._set_input_state(
+            disabled=True,
+            placeholder="Connecting...",
+            button_label="Send",
+        )
+
+    def _should_buffer_event(self, run_id: str) -> bool:
+        return (
+            self._awaiting_message_result
+            and self._active_run_id is None
+        )
+
+    def _should_render_event(self, event: Mapping[str, Any]) -> bool:
+        event_type = str(event.get("type", ""))
+        if event_type == "log.line":
+            return True
+        if event_type not in RUN_SCOPED_EVENT_TYPES:
+            return False
+
+        run_id = _run_id_from(event)
+        return self._active_run_id is not None and run_id == self._active_run_id
+
+    def _replay_pending_events(self, run_id: str) -> None:
+        for event in self._pending_events_by_run.pop(run_id, []):
+            if self._should_render_event(event):
+                self._render_event_payload(event)
+
+    def _finish_active_turn_if_matching(self, event: Mapping[str, Any]) -> None:
+        if self._active_run_id is None:
+            return
+        if event.get("run_id") != self._active_run_id:
+            return
+
+        self._mark_turn_waiting()
+
+    def _set_input_state(
+        self,
+        *,
+        disabled: bool,
+        placeholder: str,
+        button_label: str,
+    ) -> None:
+        try:
+            message_input = self.query_one("#goal-input", Input)
+            send_button = self.query_one("#run-button", Button)
+        except NoMatches:
+            return
+
+        message_input.disabled = disabled
+        message_input.placeholder = placeholder
+        send_button.disabled = disabled
+        send_button.label = button_label
+
 
 def _mapping_from(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _run_id_from(event: Mapping[str, Any]) -> str | None:
+    run_id = event.get("run_id")
+    return run_id if isinstance(run_id, str) else None
 
 
 def _int_from(value: object) -> int:
