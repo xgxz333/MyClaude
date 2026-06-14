@@ -15,6 +15,7 @@ from my_claude.core.bus.command import (
     AGENT_RUN_METHOD,
     CORE_PING_METHOD,
     EVENT_SUBSCRIBE_METHOD,
+    PERMISSION_RESPOND_METHOD,
     SESSION_CLOSE_METHOD,
     SESSION_CREATE_METHOD,
     SESSION_GET_HISTORY_METHOD,
@@ -25,6 +26,8 @@ from my_claude.core.bus.command import (
     BusResult,
     EventSubscribeCommand,
     EventSubscribeResult,
+    PermissionRespondCommand,
+    PermissionRespondResult,
     SessionCloseCommand,
     SessionCloseResult,
     SessionCreateCommand,
@@ -43,6 +46,7 @@ from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.events.bus import EventBus
 from my_claude.core.logging_setup import setup_logging
+from my_claude.core.permissions.manager import PermissionManager
 from my_claude.core.runner import (
     RunContext,
     RunResult,
@@ -78,6 +82,10 @@ def register_routes(
     )
     daemon_event_bus: EventBus[AgentEvent] = EventBus()
     daemon_event_bus.subscribe(event_broadcaster.handle)
+    permission_manager = PermissionManager(
+        policy_file=Path("~/.myclaude/policy.toml").expanduser(),
+        timeout_s=runtime_config.permission_timeout_s,
+    )
     active_run_tasks: set[asyncio.Task[RunResult]] = run_tasks if run_tasks is not None else set()
     session_manager = SessionManager(runtime_config.runs_dir, daemon_event_bus)
 
@@ -128,6 +136,7 @@ def register_routes(
             goal,
             session_manager=session_manager,
             config=runtime_config,
+            permission_manager=permission_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -167,6 +176,7 @@ def register_routes(
             message_outcome.execution_context.goal,
             config=runtime_config,
             execution_context=message_outcome.execution_context,
+            permission_manager=permission_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -201,6 +211,7 @@ def register_routes(
             message_outcome.execution_context.goal,
             config=runtime_config,
             execution_context=message_outcome.execution_context,
+            permission_manager=permission_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -232,8 +243,16 @@ def register_routes(
         if not isinstance(command, SessionCloseCommand):
             raise ValueError("session.close params are invalid")
 
+        permission_manager.cancel_session(command.params.session_id)
         await session_manager.close(command.params.session_id)
         return SessionCloseResult()
+
+    async def handle_permission_respond(request: JsonRpcRequest) -> BusResult:
+        params = request.params if isinstance(request.params, dict) else {}
+        return await _permission_respond_handler(
+            params,
+            permission_manager=permission_manager,
+        )
 
     server.register(CORE_PING_METHOD, handle_core_ping)
     server.register(EVENT_SUBSCRIBE_METHOD, handle_event_subscribe)
@@ -243,6 +262,7 @@ def register_routes(
     server.register(SESSION_SEND_MESSAGE_METHOD, handle_session_send_message)
     server.register(SESSION_GET_HISTORY_METHOD, handle_session_get_history)
     server.register(SESSION_CLOSE_METHOD, handle_session_close)
+    server.register(PERMISSION_RESPOND_METHOD, handle_permission_respond)
 
 
 async def _prepare_one_shot_session_run(
@@ -250,6 +270,7 @@ async def _prepare_one_shot_session_run(
     *,
     session_manager: SessionManager,
     config: AppConfig,
+    permission_manager: PermissionManager | None = None,
 ) -> tuple[SessionMessageOutcome, RunContext]:
     """Adapt legacy `agent.run` requests onto the session-backed execution path."""
 
@@ -264,8 +285,19 @@ async def _prepare_one_shot_session_run(
         message_outcome.execution_context.goal,
         config=config,
         execution_context=message_outcome.execution_context,
+        permission_manager=permission_manager,
     )
     return message_outcome, context
+
+
+async def _permission_respond_handler(
+    params: dict[str, object],
+    *,
+    permission_manager: PermissionManager,
+) -> PermissionRespondResult:
+    cmd = PermissionRespondCommand.model_validate(params)
+    permission_manager.respond(cmd.tool_use_id, cmd.decision)
+    return PermissionRespondResult()
 
 
 def _persist_session_result_when_done(

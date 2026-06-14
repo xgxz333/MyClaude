@@ -30,6 +30,7 @@ class AppConfig(BaseModel):
     max_request_bytes: int = Field(default=65536, gt=0)
     runs_dir: Path = Path("runs")
     agent_max_iterations: int = Field(default=20, gt=0)
+    permission_timeout_s: float = Field(default=60.0, ge=0)
     llm_provider: Literal["local", "openai-compatible", "anthropic"] = "local"
     llm_api_key: str | None = None
     llm_base_url: str = "https://api.openai.com/v1/responses"

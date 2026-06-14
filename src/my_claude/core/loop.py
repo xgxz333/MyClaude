@@ -149,11 +149,16 @@ class AgentLoop:
                     tool_use_id=tool_use.id,
                     tool_name=tool_use.name,
                     arguments=tool_use.input,
+                    params=tool_use.input,
                 )
             )
 
             started_at = time.monotonic()
-            result = await self._tools.call(tool_use.name, tool_use.input)
+            result = await self._tools.call(
+                tool_use.name,
+                tool_use.input,
+                tool_use_id=tool_use.id,
+            )
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
             self._working_memory.append_tool_result(
@@ -167,6 +172,7 @@ class AgentLoop:
                     tool_use_id=tool_use.id,
                     tool_name=tool_use.name,
                     result=None if result.is_error else result.content,
+                    output=None if result.is_error else result.content,
                     error=result.error,
                     error_type=result.error_type,
                     elapsed_ms=elapsed_ms,

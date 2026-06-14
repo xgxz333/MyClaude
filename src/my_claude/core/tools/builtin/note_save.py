@@ -6,9 +6,9 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 
 
 def _now() -> str:
@@ -18,6 +18,8 @@ def _now() -> str:
 @dataclass(frozen=True)
 class NoteSaveTool:
     """Append one long-term note to the current session's notes.md file."""
+
+    params_model: ClassVar[ParamsModel | None] = None
 
     session_id: str
     notes_path: Path

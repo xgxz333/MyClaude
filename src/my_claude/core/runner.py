@@ -26,6 +26,7 @@ from my_claude.core.config import AppConfig
 from my_claude.core.context import AnthropicMessage, ExecutionContext
 from my_claude.core.events.bus import EventBus
 from my_claude.core.events.writer import JsonlEventWriter
+from my_claude.core.permissions.manager import PermissionManager
 from my_claude.core.task.manager import TaskManager
 from my_claude.core.tools.base import BaseTool
 from my_claude.core.tools.builtin import (
@@ -61,6 +62,7 @@ class RunContext:
     working_memory: WorkingMemory
     tools: ToolRegistry
     loop_controller: LoopController
+    permission_manager: PermissionManager | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,7 @@ def prepare_run_context(
     listeners: Sequence[EventHandler] = (),
     run_id: str | None = None,
     execution_context: ExecutionContext | None = None,
+    permission_manager: PermissionManager | None = None,
 ) -> RunContext:
     if execution_context is not None:
         run_id = execution_context.run_id
@@ -220,6 +223,9 @@ def prepare_run_context(
         workspace_root=Path.cwd(),
         notes_path=_notes_path_for_execution_context(config, execution_context),
         run_id=run_id,
+        permission_manager=permission_manager,
+        event_bus=event_bus,
+        session_id=execution_context.session_id,
     )
     loop_controller = LoopController(max_iterations=config.agent_max_iterations)
     working_memory = WorkingMemory.from_execution_context(
@@ -240,6 +246,7 @@ def prepare_run_context(
         working_memory=working_memory,
         tools=tools,
         loop_controller=loop_controller,
+        permission_manager=permission_manager,
     )
 
 
@@ -249,6 +256,9 @@ def _build_registry(
     workspace_root: Path,
     notes_path: Path | None = None,
     run_id: str | None = None,
+    permission_manager: PermissionManager | None = None,
+    event_bus: EventBus[AgentEvent] | None = None,
+    session_id: str | None = None,
 ) -> ToolRegistry:
     """Build the agent toolbox with one shared task manager instance."""
 
@@ -272,7 +282,14 @@ def _build_registry(
             )
         )
 
-    return ToolRegistry(tools, timeout_seconds=130.0)
+    return ToolRegistry(
+        tools,
+        timeout_seconds=130.0,
+        permission_manager=permission_manager,
+        event_bus=event_bus,
+        run_id=run_id,
+        session_id=session_id,
+    )
 
 
 def _notes_path_for_execution_context(

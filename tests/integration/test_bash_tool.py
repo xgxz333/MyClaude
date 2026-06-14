@@ -44,6 +44,32 @@ def test_bash_tool_times_out_noninteractive_commands(tmp_path: Path) -> None:
     assert "timeout after 1s" in result.content
 
 
+def test_bash_tool_registry_rejects_invalid_timeout_before_execution(tmp_path: Path) -> None:
+    registry = ToolRegistry([BashTool(cwd=tmp_path)])
+    marker = tmp_path / "marker"
+
+    result = asyncio.run(
+        registry.call("bash", {"command": "touch marker", "timeout": 121})
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "schema_error"
+    assert result.error is not None
+    assert "timeout" in result.error
+    assert not marker.exists()
+
+
+def test_bash_tool_registry_ignores_extra_arguments(tmp_path: Path) -> None:
+    registry = ToolRegistry([BashTool(cwd=tmp_path)])
+
+    result = asyncio.run(
+        registry.call("bash", {"command": "printf 'ok'", "unexpected": "ignored"})
+    )
+
+    assert result.is_error is False
+    assert "stdout:\nok" in result.content
+
+
 def test_bash_tool_truncates_large_output_without_deadlock(tmp_path: Path) -> None:
     tool = BashTool(cwd=tmp_path, max_output_bytes=32)
 

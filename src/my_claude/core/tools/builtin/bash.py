@@ -7,9 +7,11 @@ import os
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, ClassVar
 
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from pydantic import BaseModel, ConfigDict, Field
+
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 120
@@ -17,9 +19,23 @@ MAX_OUTPUT_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 8192
 
 
+class BashParams(BaseModel):
+    """Arguments accepted by the bash tool."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    command: Annotated[str, Field(strict=True)]
+    timeout: Annotated[
+        int,
+        Field(default=DEFAULT_TIMEOUT_SECONDS, ge=1, le=MAX_TIMEOUT_SECONDS, strict=True),
+    ]
+
+
 @dataclass(frozen=True)
 class BashTool:
     """Execute a non-interactive shell command without blocking the event loop."""
+
+    params_model: ClassVar[ParamsModel] = BashParams
 
     cwd: Path
     default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS

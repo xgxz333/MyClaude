@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 from my_claude.core.tools.builtin.read_file import resolve_safe_path
 
 DEFAULT_MAX_DEPTH = 4
@@ -17,6 +17,8 @@ DEFAULT_MAX_ENTRIES = 200
 @dataclass(frozen=True)
 class ListDirTool:
     """List a directory tree under a fixed root."""
+
+    params_model: ClassVar[ParamsModel | None] = None
 
     root: Path = Path.cwd()
     max_depth: int = DEFAULT_MAX_DEPTH

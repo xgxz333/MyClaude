@@ -9,16 +9,19 @@ from contextlib import suppress
 from typing import Any
 
 from pydantic import ValidationError
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static
 
 from my_claude.agent.events import AgentEvent, AgentEventType, KnownAgentEventAdapter
 from my_claude.core.bus.command import (
     EVENT_SUBSCRIBE_METHOD,
+    PERMISSION_RESPOND_METHOD,
     SESSION_CLOSE_METHOD,
     SESSION_CREATE_METHOD,
     SESSION_SEND_MESSAGE_METHOD,
@@ -36,7 +39,11 @@ RUN_SCOPED_EVENT_TYPES = {
     AgentEventType.LLM_MODEL_SELECTED.value,
     AgentEventType.LLM_RESPONSE_COMPLETED.value,
     AgentEventType.TOOL_CALL_STARTED.value,
+    AgentEventType.TOOL_CALL_FAILED.value,
     AgentEventType.TOOL_CALL_COMPLETED.value,
+    AgentEventType.PERMISSION_REQUESTED.value,
+    AgentEventType.PERMISSION_GRANTED.value,
+    AgentEventType.PERMISSION_DENIED.value,
     AgentEventType.RUN_COMPLETED.value,
     AgentEventType.RUN_CANCELLED.value,
     AgentEventType.RUN_FAILED.value,
@@ -123,6 +130,137 @@ class ToolCallBlock(Widget):
         self.add_class("expanded")
 
 
+class PermissionBlock(Static):
+    """Static log entry shown when a tool call is waiting for approval."""
+
+    DEFAULT_CSS = "PermissionBlock { padding: 0 2; color: yellow; }"
+    _LABEL_MAP = {
+        "allow_once": "allowed (once)",
+        "always_allow": "always allowed",
+        "deny_once": "denied",
+        "always_deny": "always denied",
+        "timeout": "timed out",
+    }
+
+    class Resolved(Message):
+        """Message emitted when the permission log block is resolved."""
+
+        def __init__(self, block: PermissionBlock, decision: str) -> None:
+            self.block = block
+            self.decision = decision
+            super().__init__()
+
+    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+        self.tool_use_id = tool_use_id
+        self.tool_name = tool_name
+        self.param_preview = param_preview
+        self._resolved = False
+        super().__init__(self._pending_text())
+
+    def _pending_text(self) -> str:
+        preview = f"  [dim]{self.param_preview}[/dim]" if self.param_preview else ""
+        return f"[bold yellow]? permission[/bold yellow]  [bold]{self.tool_name}[/bold]{preview}"
+
+    def _resolve(self, decision: str) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        allowed = decision in ("allow_once", "always_allow")
+        icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
+        label = self._LABEL_MAP.get(decision, decision)
+        preview = f"  [dim]{self.param_preview}[/dim]" if self.param_preview else ""
+        self.update(
+            f"{icon} permission  [bold]{self.tool_name}[/bold]{preview}  [dim]{label}[/dim]"
+        )
+        self.post_message(self.Resolved(self, decision))
+
+
+class PermissionSelect(Static):
+    """Focusable inline approval control for one pending permission request."""
+
+    DEFAULT_CSS = """
+    PermissionSelect {
+        padding: 0 2 1 2;
+        color: $text;
+    }
+    PermissionSelect:focus {
+        text-style: bold;
+        background: $boost;
+    }
+    """
+
+    can_focus = True
+    _CHOICES: tuple[tuple[str, str, str], ...] = (
+        ("allow_once", "Allow once", "y / 1"),
+        ("always_allow", "Always allow", "a / 2"),
+        ("deny_once", "Deny", "n / 3"),
+        ("always_deny", "Always deny", "d / 4"),
+    )
+    _KEY_MAP: dict[str, str] = {
+        "y": "allow_once",
+        "1": "allow_once",
+        "a": "always_allow",
+        "2": "always_allow",
+        "n": "deny_once",
+        "3": "deny_once",
+        "d": "always_deny",
+        "4": "always_deny",
+    }
+
+    class Decided(Message):
+        """Message emitted when the user picks a permission decision."""
+
+        def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
+            self.widget = widget
+            self.tool_use_id = tool_use_id
+            self.decision = decision
+            super().__init__()
+
+    def __init__(self, tool_use_id: str) -> None:
+        super().__init__("")
+        self.tool_use_id = tool_use_id
+        self._cursor = 0
+
+    def on_mount(self) -> None:
+        self.update(self._render_ui())
+        self.focus()
+
+    def _render_ui(self) -> str:
+        lines: list[str] = []
+        for index, (_decision, label, key_hint) in enumerate(self._CHOICES):
+            if index == self._cursor:
+                lines.append(f"  [bold cyan]> {label}[/bold cyan]  [dim]{key_hint}[/dim]")
+            else:
+                lines.append(f"    {label}  [dim]{key_hint}[/dim]")
+        lines.append("[dim]  up/down navigate   enter confirm[/dim]")
+        return "\n".join(lines)
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        if key in ("up", "k"):
+            event.stop()
+            self._cursor = (self._cursor - 1) % len(self._CHOICES)
+            self.update(self._render_ui())
+            return
+        if key in ("down", "j"):
+            event.stop()
+            self._cursor = (self._cursor + 1) % len(self._CHOICES)
+            self.update(self._render_ui())
+            return
+        if key == "enter":
+            event.stop()
+            self._pick(self._CHOICES[self._cursor][0])
+            return
+
+        decision = self._KEY_MAP.get(key)
+        if decision is not None:
+            event.stop()
+            self._pick(decision)
+
+    def _pick(self, decision: str) -> None:
+        self.post_message(self.Decided(self, self.tool_use_id, decision))
+
+
 class MyClaudeTui(App[None]):
     """Terminal UI that subscribes to daemon events over one long-lived socket."""
 
@@ -172,6 +310,8 @@ class MyClaudeTui(App[None]):
         self._pending_events_by_run: dict[str, list[Mapping[str, Any]]] = {}
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
+        self._pending_permission_blocks: dict[str, PermissionBlock] = {}
+        self._pending_permission_selects: dict[str, PermissionSelect] = {}
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]MyClaude[/bold]  [dim]connecting...[/dim]", id="header")
@@ -202,18 +342,56 @@ class MyClaudeTui(App[None]):
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "run-button":
-            await self._submit_message()
+            self._submit_message()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "goal-input":
-            await self._submit_message()
+            self._submit_message()
+
+    def on_key(self, event: events.Key) -> None:
+        if not self._pending_permission_selects:
+            return
+        select = next(iter(self._pending_permission_selects.values()))
+        if select.has_focus:
+            return
+        if event.key in PermissionSelect._KEY_MAP or event.key in ("up", "down", "k", "j", "enter"):
+            select.on_key(event)
+
+    def on_chat_text_area_submitted(self, event: Any) -> None:
+        value = getattr(event, "value", None)
+        if value is None:
+            text_area = getattr(event, "text_area", None)
+            value = getattr(text_area, "text", None)
+            if value is None:
+                value = getattr(text_area, "value", "")
+        content = str(value).strip()
+        if content:
+            self._submit_message(content=content)
+
+    async def on_permission_select_decided(self, message: PermissionSelect.Decided) -> None:
+        tool_use_id = message.tool_use_id
+        decision = message.decision
+        self._pending_permission_selects.pop(tool_use_id, None)
+        with suppress(Exception):
+            message.widget.remove()
+
+        permission_block = self._pending_permission_blocks.pop(tool_use_id, None)
+        if permission_block is not None:
+            permission_block._resolve(decision)
+
+        self.run_worker(
+            self._do_respond_permission(tool_use_id, decision),
+            name=f"permission_respond:{tool_use_id}",
+            exclusive=False,
+            exit_on_error=False,
+        )
 
     async def _submit_goal(self) -> None:
-        await self._submit_message()
+        self._submit_message()
 
-    async def _submit_message(self) -> None:
+    def _submit_message(self, *, content: str | None = None) -> None:
         message_input = self.query_one("#goal-input", Input)
-        message = message_input.value.strip()
+        message = (content if content is not None else message_input.value).strip()
         if not message:
             return
 
@@ -231,15 +409,32 @@ class MyClaudeTui(App[None]):
             return
 
         self._awaiting_message_result = True
+        message_input.value = ""
+        self._append(Static(f"[bold]you[/bold]  {message}", classes="user-message"))
         self._set_input_state(
             disabled=True,
             placeholder="Sending...",
             button_label="Busy",
         )
+        self.run_worker(
+            self._do_send_message(message),
+            name="send_message",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _do_send_message(self, content: str) -> None:
+        client = self._client
+        if client is None or not client.is_connected or self._session_id is None:
+            self._awaiting_message_result = False
+            self._mark_turn_waiting()
+            self._append_log("ERROR", "tui", "daemon is not connected")
+            return
+
         try:
             result = await client.request(
                 SESSION_SEND_MESSAGE_METHOD,
-                {"session_id": self._session_id, "content": message},
+                {"session_id": self._session_id, "content": content},
             )
         except SocketClientError as error:
             self._awaiting_message_result = False
@@ -247,8 +442,6 @@ class MyClaudeTui(App[None]):
             self._append_log("ERROR", "tui", f"failed to send: {error}")
             return
 
-        message_input.value = ""
-        self._append(Static(f"[bold]you[/bold]  {message}", classes="user-message"))
         self._awaiting_message_result = False
         self._mark_turn_running(str(result["run_id"]))
 
@@ -274,6 +467,7 @@ class MyClaudeTui(App[None]):
                     {
                         "topics": [
                             "session.*",
+                            "permission.*",
                             "run.*",
                             "step.*",
                             "tool.*",
@@ -436,6 +630,40 @@ class MyClaudeTui(App[None]):
                     is_error=error is not None,
                 )
 
+        elif event_type == AgentEventType.TOOL_CALL_FAILED:
+            tool_use_id = str(event.get("tool_use_id", ""))
+            elapsed_ms = _int_from(event.get("elapsed_ms"))
+            error = event.get("error_message")
+            if error is None:
+                error = event.get("error")
+
+            if tool_use_id in self._pending_tool_blocks:
+                tool_block = self._pending_tool_blocks.pop(tool_use_id)
+                tool_block.set_result(str(error or ""), elapsed_ms, is_error=True)
+
+        elif event_type == AgentEventType.PERMISSION_REQUESTED:
+            tool_use_id = str(event.get("tool_use_id", ""))
+            tool_name = str(event.get("tool_name", ""))
+            param_preview = str(event.get("param_preview", ""))
+            permission_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            self._pending_permission_blocks[tool_use_id] = permission_block
+            self._set_input_state(
+                disabled=True,
+                placeholder="Permission required...",
+                button_label="Busy",
+            )
+            self._append(permission_block)
+            select = PermissionSelect(tool_use_id)
+            self._mount_permission_select(select)
+
+        elif event_type in (
+            AgentEventType.PERMISSION_GRANTED,
+            AgentEventType.PERMISSION_DENIED,
+        ):
+            tool_use_id = str(event.get("tool_use_id", ""))
+            decision = str(event.get("decision", ""))
+            self._resolve_permission(tool_use_id, decision)
+
         elif event_type == AgentEventType.RUN_COMPLETED:
             status = event.get("status", "success")
             steps = event.get("steps", 0) or 0
@@ -478,6 +706,46 @@ class MyClaudeTui(App[None]):
                 str(event.get("source", "")),
                 str(event.get("message", "")),
             )
+
+    def _mount_permission_select(self, select: PermissionSelect) -> None:
+        self._pending_permission_selects[select.tool_use_id] = select
+        try:
+            self.mount(select, before="#command-bar")
+        except Exception:
+            self._append(select)
+
+    def _respond_permission(self, tool_use_id: str, decision: str) -> None:
+        self._resolve_permission(tool_use_id, decision)
+        self.run_worker(
+            self._do_respond_permission(tool_use_id, decision),
+            name=f"permission_respond:{tool_use_id}",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _do_respond_permission(self, tool_use_id: str, decision: str) -> None:
+        client = self._client
+        if client is None or not client.is_connected:
+            self._append_log("ERROR", "tui", "daemon is not connected")
+            return
+
+        try:
+            await client.request(
+                PERMISSION_RESPOND_METHOD,
+                {"tool_use_id": tool_use_id, "decision": decision},
+            )
+        except SocketClientError as error:
+            self._append_log("ERROR", "tui", f"failed to respond: {error}")
+
+    def _resolve_permission(self, tool_use_id: str, decision: str) -> None:
+        select = self._pending_permission_selects.pop(tool_use_id, None)
+        if select is not None:
+            with suppress(Exception):
+                select.remove()
+
+        permission_block = self._pending_permission_blocks.pop(tool_use_id, None)
+        if permission_block is not None:
+            permission_block._resolve(decision)
 
     def _append_failed_run(self, *, reason: str, steps: object) -> None:
         detail = f"  [dim]{reason}[/dim]" if reason else ""

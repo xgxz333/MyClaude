@@ -6,6 +6,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from pydantic import BaseModel
+
+ParamsModel = type[BaseModel]
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -49,6 +53,11 @@ class BaseTool(Protocol):
     """Abstract template for tools that always return ToolResult."""
 
     @property
+    def params_model(self) -> ParamsModel | None:
+        """Return an optional Pydantic model used to validate tool arguments."""
+        ...
+
+    @property
     def definition(self) -> ToolDefinition:
         """Return the public definition shown to the LLM."""
         ...
@@ -67,6 +76,7 @@ class FunctionTool:
 
     definition: ToolDefinition
     handler: ToolHandler
+    params_model: ParamsModel | None = None
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:

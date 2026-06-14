@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 from my_claude.core.task.manager import TaskManager
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 
 
 @dataclass(frozen=True)
 class TaskCreateTool:
     """Create a task in the shared per-run task manager."""
+
+    params_model: ClassVar[ParamsModel | None] = None
 
     task_manager: TaskManager
 

@@ -19,6 +19,7 @@ SESSION_MESSAGE_METHOD: Literal["session.message"] = "session.message"
 SESSION_SEND_MESSAGE_METHOD: Literal["session.send_message"] = "session.send_message"
 SESSION_GET_HISTORY_METHOD: Literal["session.get_history"] = "session.get_history"
 SESSION_CLOSE_METHOD: Literal["session.close"] = "session.close"
+PERMISSION_RESPOND_METHOD: Literal["permission.respond"] = "permission.respond"
 PACKAGE_NAME = "MyClaude"
 FALLBACK_VERSION = "0.1.0"
 
@@ -242,6 +243,24 @@ class SessionCloseResult(BaseModel):
     status: Literal["closed"] = "closed"
 
 
+class PermissionRespondCommand(BaseModel):
+    """Command envelope for resolving a pending permission request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["permission.respond"] = PERMISSION_RESPOND_METHOD
+    tool_use_id: str = Field(min_length=1)
+    decision: str = Field(min_length=1)
+
+
+class PermissionRespondResult(BaseModel):
+    """Empty result returned after accepting a permission response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool = True
+
+
 BusCommand = (
     CorePingCommand
     | EventSubscribeCommand
@@ -251,6 +270,7 @@ BusCommand = (
     | SessionSendMessageCommand
     | SessionGetHistoryCommand
     | SessionCloseCommand
+    | PermissionRespondCommand
 )
 BusResult = (
     CorePingResult
@@ -261,6 +281,7 @@ BusResult = (
     | SessionSendMessageResult
     | SessionGetHistoryResult
     | SessionCloseResult
+    | PermissionRespondResult
 )
 
 
@@ -274,6 +295,7 @@ def command_from_request(request: JsonRpcRequest) -> BusCommand:
         SESSION_SEND_MESSAGE_METHOD,
         SESSION_GET_HISTORY_METHOD,
         SESSION_CLOSE_METHOD,
+        PERMISSION_RESPOND_METHOD,
     }:
         raise ValueError(f"unknown command method: {request.method}")
 
@@ -296,6 +318,8 @@ def command_from_request(request: JsonRpcRequest) -> BusCommand:
         return SessionGetHistoryCommand.model_validate(payload)
     if request.method == SESSION_CLOSE_METHOD:
         return SessionCloseCommand.model_validate(payload)
+    if request.method == PERMISSION_RESPOND_METHOD:
+        return PermissionRespondCommand.model_validate(params)
 
     return AgentRunCommand.model_validate(payload)
 

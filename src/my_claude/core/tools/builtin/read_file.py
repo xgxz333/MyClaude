@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 
 DEFAULT_MAX_BYTES = 512 * 1024
 DEFAULT_MAX_CHARS = 512 * 1024
@@ -16,6 +16,8 @@ DEFAULT_MAX_CHARS = 512 * 1024
 @dataclass(frozen=True)
 class ReadFileTool:
     """Read a text file under a fixed root without allowing path traversal."""
+
+    params_model: ClassVar[ParamsModel | None] = None
 
     root: Path = Path.cwd()
     max_bytes: int = DEFAULT_MAX_BYTES

@@ -7,13 +7,20 @@ from my_claude.agent.events import (
     LLMResponseCompletedEvent,
     LLMTokenEvent,
     LLMUsageEvent,
+    PermissionRequestedEvent,
     RunCompletedEvent,
     RunStartedEvent,
     StepStartedEvent,
     ToolCallCompletedEvent,
     ToolCallStartedEvent,
 )
-from my_claude.tui.app import LLMStreamBlock, MyClaudeTui, ToolCallBlock
+from my_claude.tui.app import (
+    LLMStreamBlock,
+    MyClaudeTui,
+    PermissionBlock,
+    PermissionSelect,
+    ToolCallBlock,
+)
 
 
 def test_tui_accumulates_streaming_llm_tokens_in_place() -> None:
@@ -159,6 +166,43 @@ def test_tui_renders_tool_calls_as_collapsible_blocks_like_kama() -> None:
     )
 
 
+def test_tui_renders_permission_request_with_focusable_select() -> None:
+    app = RenderlessTui()
+    app._mark_turn_running("run-1")
+
+    app._write_event(
+        PermissionRequestedEvent(
+            run_id="run-1",
+            tool_use_id="tool-1",
+            tool_name="bash",
+            params={"command": "cat /etc/passwd"},
+            param_preview="cat /etc/passwd",
+        )
+    )
+
+    assert len(app.mounted_widgets) == 2
+    block = app.mounted_widgets[0]
+    select = app.mounted_widgets[1]
+    assert isinstance(block, PermissionBlock)
+    assert isinstance(select, PermissionSelect)
+    assert app._pending_permission_blocks["tool-1"] is block
+    assert select.tool_use_id == "tool-1"
+
+
+def test_tui_submit_message_schedules_background_worker() -> None:
+    app = WorkerRecordingTui()
+    app._client = ConnectedClient()
+    app._session_id = "sess-1"
+    app.message_input.value = "ship it"
+
+    app._submit_message()
+
+    assert app.message_input.value == ""
+    assert app.worker_calls == [("send_message", False)]
+    assert app.static_texts == ["[bold]you[/bold]  ship it"]
+    assert app.input_states[-1] == (True, "Sending...", "Busy")
+
+
 def test_tool_call_block_click_lazily_loads_details_and_toggles_state() -> None:
     block = ToolCallBlock(
         "write_file",
@@ -212,3 +256,54 @@ class RenderlessTui(MyClaudeTui):
         button_label: str,
     ) -> None:
         self.input_states.append((disabled, placeholder, button_label))
+
+
+class FakeInput:
+    def __init__(self) -> None:
+        self.value = ""
+        self.disabled = False
+        self.placeholder = ""
+
+
+class FakeButton:
+    def __init__(self) -> None:
+        self.disabled = False
+        self.label = ""
+
+
+class ConnectedClient:
+    is_connected = True
+
+    async def request(self, _method: str, _params: dict[str, str]) -> dict[str, str]:
+        raise AssertionError("request should run only inside the worker")
+
+
+class WorkerRecordingTui(RenderlessTui):
+    def __init__(self) -> None:
+        super().__init__()
+        self.message_input = FakeInput()
+        self.send_button = FakeButton()
+        self.worker_calls: list[tuple[str | None, bool]] = []
+
+    def query_one(self, selector: str, widget_type: object = None) -> object:
+        del widget_type
+        if selector == "#goal-input":
+            return self.message_input
+        if selector == "#run-button":
+            return self.send_button
+        raise LookupError(selector)
+
+    def run_worker(
+        self,
+        work: object,
+        *,
+        name: str | None = None,
+        exclusive: bool = True,
+        exit_on_error: bool = True,
+        **kwargs: object,
+    ) -> None:
+        del exit_on_error, kwargs
+        self.worker_calls.append((name, exclusive))
+        close = getattr(work, "close", None)
+        if callable(close):
+            close()

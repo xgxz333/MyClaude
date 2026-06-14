@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from my_claude.core.tools.base import ToolDefinition, ToolResult
+from my_claude.core.tools.base import ParamsModel, ToolDefinition, ToolResult
 from my_claude.core.tools.builtin.read_file import resolve_safe_path
 
 DEFAULT_MAX_BYTES = 1024 * 1024
@@ -16,6 +16,8 @@ DEFAULT_MAX_BYTES = 1024 * 1024
 @dataclass(frozen=True)
 class WriteFileTool:
     """Write UTF-8 text under a fixed root without allowing path traversal."""
+
+    params_model: ClassVar[ParamsModel | None] = None
 
     root: Path = Path.cwd()
     max_bytes: int = DEFAULT_MAX_BYTES

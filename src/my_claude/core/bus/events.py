@@ -21,7 +21,11 @@ class AgentEventType(StrEnum):
     LLM_MODEL_SELECTED = "llm.model_selected"
     LLM_RESPONSE_COMPLETED = "llm.response_completed"
     TOOL_CALL_STARTED = "tool.call_started"
+    TOOL_CALL_FAILED = "tool.call_failed"
     TOOL_CALL_COMPLETED = "tool.call_finished"
+    PERMISSION_REQUESTED = "permission.requested"
+    PERMISSION_GRANTED = "permission.granted"
+    PERMISSION_DENIED = "permission.denied"
     RUN_COMPLETED = "run.finished"
     RUN_CANCELLED = "run.cancelled"
     RUN_FAILED = "run.failed"
@@ -136,6 +140,7 @@ class ToolCallStartedEvent(AgentEvent):
     tool_use_id: str
     tool_name: str
     arguments: Mapping[str, Any]
+    params: Mapping[str, Any] | None = None
 
 
 class ToolCallCompletedEvent(AgentEvent):
@@ -147,9 +152,66 @@ class ToolCallCompletedEvent(AgentEvent):
     tool_use_id: str | None = None
     tool_name: str
     result: str | None = None
+    output: str | None = None
     error: str | None = None
     error_type: str | None = None
     elapsed_ms: int | None = None
+    ts: str | None = None
+
+
+class ToolCallFailedEvent(AgentEvent):
+    """Event emitted when a retryable tool attempt fails before final completion."""
+
+    type: Literal[AgentEventType.TOOL_CALL_FAILED] = AgentEventType.TOOL_CALL_FAILED
+    message: str = "tool call attempt failed"
+    run_id: str | None = None
+    tool_use_id: str | None = None
+    tool_name: str
+    error_class: str | None = None
+    error_message: str | None = None
+    error: str | None = None
+    error_type: str | None = None
+    elapsed_ms: int | None = None
+    attempt: int
+    ts: str | None = None
+
+
+class PermissionRequestedEvent(AgentEvent):
+    """Event emitted when a tool call needs user approval."""
+
+    type: Literal[AgentEventType.PERMISSION_REQUESTED] = (
+        AgentEventType.PERMISSION_REQUESTED
+    )
+    message: str = "permission requested"
+    run_id: str | None = None
+    tool_use_id: str
+    tool_name: str
+    params: Mapping[str, Any]
+    param_preview: str
+    session_id: str = ""
+    ts: str | None = None
+
+
+class PermissionGrantedEvent(AgentEvent):
+    """Event emitted after an interactive permission request is approved."""
+
+    type: Literal[AgentEventType.PERMISSION_GRANTED] = AgentEventType.PERMISSION_GRANTED
+    message: str = "permission granted"
+    run_id: str | None = None
+    tool_use_id: str
+    decision: str
+    ts: str | None = None
+
+
+class PermissionDeniedEvent(AgentEvent):
+    """Event emitted after an interactive permission request is denied."""
+
+    type: Literal[AgentEventType.PERMISSION_DENIED] = AgentEventType.PERMISSION_DENIED
+    message: str = "permission denied"
+    run_id: str | None = None
+    tool_use_id: str
+    decision: str
+    ts: str | None = None
 
 
 class RunCompletedEvent(AgentEvent):
@@ -241,7 +303,11 @@ KnownAgentEvent = (
     | LLMModelSelectedEvent
     | LLMResponseCompletedEvent
     | ToolCallStartedEvent
+    | ToolCallFailedEvent
     | ToolCallCompletedEvent
+    | PermissionRequestedEvent
+    | PermissionGrantedEvent
+    | PermissionDeniedEvent
     | RunCompletedEvent
     | RunCancelledEvent
     | RunFailedEvent

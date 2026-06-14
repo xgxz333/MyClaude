@@ -46,9 +46,11 @@ def test_trace_record_from_event_marks_core_event_flow_and_keeps_full_event_payl
         "tool_use_id": "tool-1",
         "tool_name": "read_file",
         "result": "ok",
+        "output": None,
         "error": None,
         "error_type": None,
         "elapsed_ms": 12,
+        "ts": None,
     }
 
 

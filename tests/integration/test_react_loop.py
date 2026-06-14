@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import my_claude.core.tools.invocation as invocation_module
 from my_claude.agent.control import LoopController
 from my_claude.agent.events import AgentEvent, AgentEventType
 from my_claude.agent.tools import Tool, ToolDefinition, ToolRegistry, ToolResult
@@ -137,7 +138,11 @@ def test_react_loop_marks_memory_cancelled_when_external_cancel_is_requested() -
     assert memory.status_transition_reason == "cancelled before planning"
 
 
-def test_react_loop_records_tool_error_without_raising() -> None:
+def test_react_loop_records_tool_error_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(invocation_module, "_RETRY_BASE_S", 0.0)
+
     events: list[AgentEvent] = []
 
     async def handle(event: AgentEvent) -> None:
