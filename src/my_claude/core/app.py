@@ -49,6 +49,7 @@ from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.events.bus import EventBus
 from my_claude.core.logging_setup import setup_logging
+from my_claude.core.mcp import McpServerManager
 from my_claude.core.permissions.manager import PermissionManager
 from my_claude.core.runner import (
     RunContext,
@@ -75,6 +76,7 @@ def register_routes(
     server_version: str | None = None,
     run_tasks: set[asyncio.Task[RunResult]] | None = None,
     trace_writer: TraceWriter | None = None,
+    mcp_manager: McpServerManager | None = None,
 ) -> None:
     start_time = started_at if started_at is not None else time.perf_counter()
     version = server_version or get_server_version()
@@ -149,6 +151,7 @@ def register_routes(
             session_manager=session_manager,
             config=runtime_config,
             permission_manager=permission_manager,
+            mcp_manager=mcp_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -189,6 +192,7 @@ def register_routes(
             config=runtime_config,
             execution_context=message_outcome.execution_context,
             permission_manager=permission_manager,
+            mcp_manager=mcp_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -224,6 +228,7 @@ def register_routes(
             config=runtime_config,
             execution_context=message_outcome.execution_context,
             permission_manager=permission_manager,
+            mcp_manager=mcp_manager,
         )
         run_task = _schedule_background_run(
             context,
@@ -295,6 +300,7 @@ async def _prepare_one_shot_session_run(
     session_manager: SessionManager,
     config: AppConfig,
     permission_manager: PermissionManager | None = None,
+    mcp_manager: McpServerManager | None = None,
 ) -> tuple[SessionMessageOutcome, RunContext]:
     """Adapt legacy `agent.run` requests onto the session-backed execution path."""
 
@@ -310,6 +316,7 @@ async def _prepare_one_shot_session_run(
         config=config,
         execution_context=message_outcome.execution_context,
         permission_manager=permission_manager,
+        mcp_manager=mcp_manager,
     )
     return message_outcome, context
 
@@ -444,6 +451,9 @@ async def _run_async() -> None:
     setup_logging(config)
     shutdown_event = asyncio.Event()
     trace_writer: TraceWriter | None = None
+    mcp_manager = McpServerManager()
+    if config.mcp_servers:
+        await mcp_manager.start_all(config.mcp_servers)
     if config.trace_enabled:
         trace_writer = TraceWriter(_trace_path(config))
         await trace_writer.start()
@@ -460,6 +470,7 @@ async def _run_async() -> None:
         started_at=started_at,
         run_tasks=run_tasks,
         trace_writer=trace_writer,
+        mcp_manager=mcp_manager,
     )
 
     logger = logging.getLogger(__name__)
@@ -478,6 +489,7 @@ async def _run_async() -> None:
     finally:
         await server.shutdown()
         await _cancel_background_runs(run_tasks)
+        await mcp_manager.shutdown()
         if trace_writer is not None:
             await trace_writer.stop()
 

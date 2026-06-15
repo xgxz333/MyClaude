@@ -25,9 +25,13 @@ class ListDirTool:
     max_entries: int = DEFAULT_MAX_ENTRIES
 
     @property
+    def name(self) -> str:
+        return "list_dir"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="list_dir",
+            name=self.name,
             description=(
                 "List the contents of a directory under the workspace root as a tree. "
                 "Hidden entries are included. Output depth and total entries are limited."

@@ -140,6 +140,7 @@ def test_tool_registry_validates_pydantic_params_before_tool_execution() -> None
         value: str = Field(strict=True)
 
     class RecordingTool:
+        name = "echo"
         params_model = EchoParams
         definition = ToolDefinition(name="echo", description="Echo a value.")
         calls = 0
@@ -169,6 +170,7 @@ def test_tool_registry_passes_pydantic_model_dump_to_tool() -> None:
         count: int = Field(default=1, strict=True)
 
     class RecordingTool:
+        name = "echo"
         params_model = EchoParams
         definition = ToolDefinition(name="echo", description="Echo a value.")
 
@@ -254,6 +256,7 @@ def test_tool_registry_retries_rate_limited_exceptions(
     monkeypatch.setattr(invocation_module, "_RETRY_BASE_S", 0.0)
 
     class RateLimitedTool:
+        name = "limited"
         definition = ToolDefinition(name="limited", description="Rate limited.")
         attempts = 0
 
@@ -304,6 +307,7 @@ def test_tool_registry_catches_unexpected_tool_exceptions(
     monkeypatch.setattr(invocation_module, "_RETRY_BASE_S", 0.0)
 
     class ExplodingTool:
+        name = "boom"
         definition = ToolDefinition(name="boom", description="Raise outside FunctionTool.")
 
         async def run(self, _arguments: dict[str, Any]) -> ToolResult:

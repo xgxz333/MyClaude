@@ -35,7 +35,7 @@ class ToolRegistry:
             self.register(tool)
 
     def register(self, tool: BaseTool) -> None:
-        self._tools[tool.definition.name] = tool
+        self._tools[tool.name] = tool
 
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition for tool in self._tools.values()]

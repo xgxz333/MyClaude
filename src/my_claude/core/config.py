@@ -25,6 +25,20 @@ class CompactionConfig(BaseModel):
     tool_result_keep: int = 4_000
 
 
+class McpServerConfig(BaseModel):
+    """Configuration for one external MCP server."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    transport: Literal["stdio", "tcp"]
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    host: str | None = None
+    port: int | None = Field(default=None, gt=0, le=65535)
+
+
 class AppConfig(BaseModel):
     """Validated runtime settings shared by CLI, core server, and agent runner."""
 
@@ -51,6 +65,7 @@ class AppConfig(BaseModel):
     trace_file: Path | None = None
     trace_include_llm_payload: bool = True
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    mcp_servers: list[McpServerConfig] = Field(default_factory=list)
 
 
 def load_config(
@@ -81,6 +96,11 @@ def _load_toml_config(config_file: Path) -> dict[str, Any]:
     compaction = data.get("compaction")
     if "compaction" not in values and isinstance(compaction, dict):
         values["compaction"] = compaction
+    mcp = data.get("mcp")
+    if "mcp_servers" not in values and isinstance(mcp, dict):
+        servers = mcp.get("servers")
+        if isinstance(servers, list):
+            values["mcp_servers"] = servers
     return values
 
 

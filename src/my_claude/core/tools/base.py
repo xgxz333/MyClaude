@@ -53,6 +53,11 @@ class BaseTool(Protocol):
     """Abstract template for tools that always return ToolResult."""
 
     @property
+    def name(self) -> str:
+        """Return the public tool name used for registration and whitelisting."""
+        ...
+
+    @property
     def params_model(self) -> ParamsModel | None:
         """Return an optional Pydantic model used to validate tool arguments."""
         ...
@@ -77,6 +82,10 @@ class FunctionTool:
     definition: ToolDefinition
     handler: ToolHandler
     params_model: ParamsModel | None = None
+
+    @property
+    def name(self) -> str:
+        return self.definition.name
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         try:

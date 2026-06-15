@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from my_claude.agent.events import AgentEvent
+from my_claude.agent.events import AgentEvent, SkillInvokedEvent
 from my_claude.core.app import register_routes
 from my_claude.core.bus.command import (
     EVENT_SUBSCRIBE_METHOD,
@@ -200,6 +200,51 @@ def test_session_message_restores_execution_context_from_persistent_session(
     llm_messages = execution_context.llm_messages()
     assert llm_messages[0].text == "old question"
     assert llm_messages[-1].text == "new question"
+
+
+def test_session_slash_command_invokes_builtin_skill(tmp_path: Path) -> None:
+    execution_context, events = asyncio.run(
+        _start_slash_command_and_collect_events(
+            tmp_path,
+            "/orchestrate build an agent",
+        )
+    )
+
+    assert execution_context.goal == (
+        "你是 multi-agent 协调者。请完成以下目标：\n"
+        "\n"
+        "build an agent\n"
+        "\n"
+        "请先派生 planner，再根据计划派生 executor，最后派生 reviewer。"
+    )
+    assert execution_context.system_prompt_override is not None
+    assert "$ARGUMENTS" in execution_context.system_prompt_override
+    assert execution_context.tool_whitelist == [
+        "spawn_agent",
+        "agent_result",
+        "task_create",
+        "task_update",
+        "task_list",
+    ]
+    assert execution_context.llm_messages()[-1].text == execution_context.goal
+    assert len(events) == 1
+    assert events[0].skill_name == "orchestrate"
+    assert events[0].arguments == "build an agent"
+
+
+def test_unknown_slash_command_falls_back_to_plain_message(tmp_path: Path) -> None:
+    execution_context, events = asyncio.run(
+        _start_slash_command_and_collect_events(
+            tmp_path,
+            "/unknown build an agent",
+        )
+    )
+
+    assert execution_context.goal == "/unknown build an agent"
+    assert execution_context.system_prompt_override is None
+    assert execution_context.tool_whitelist is None
+    assert execution_context.llm_messages()[-1].text == "/unknown build an agent"
+    assert events == []
 
 
 def test_session_store_reads_full_history_without_sliding_window(tmp_path: Path) -> None:
@@ -521,6 +566,28 @@ async def _restore_session_and_build_execution_context(tmp_path: Path) -> Execut
         run_id="run-restored",
     )
     return message_outcome.execution_context
+
+
+async def _start_slash_command_and_collect_events(
+    tmp_path: Path,
+    message: str,
+) -> tuple[ExecutionContext, list[SkillInvokedEvent]]:
+    bus: EventBus[AgentEvent] = EventBus()
+    events: list[SkillInvokedEvent] = []
+    manager = SessionManager(tmp_path / "runs", bus)
+
+    async def collect(event: AgentEvent) -> None:
+        if isinstance(event, SkillInvokedEvent):
+            events.append(event)
+
+    bus.subscribe(collect)
+    create_outcome = await manager.create(title="slash")
+    message_outcome = await manager.start_message(
+        session_id=create_outcome.session.session_id,
+        message=message,
+        run_id="run-slash",
+    )
+    return message_outcome.execution_context, events
 
 
 async def _save_note_and_restore_context(tmp_path: Path) -> tuple[ExecutionContext, Path]:

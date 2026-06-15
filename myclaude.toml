@@ -1,0 +1,11 @@
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "你的-mcp-server-命令"
+args = ["--root", "."]
+
+[[mcp.servers]]
+name = "internal-kb"
+transport = "tcp"
+host = "10.0.0.5"
+port = 3000

@@ -120,6 +120,9 @@ class ExecutionContext(BaseModel):
     semantic_memory: list[SemanticMemoryItem] = Field(default_factory=list)
     global_context: str = ""
     project_context: str = ""
+    system_prompt_override: str | None = None
+    tool_whitelist: list[str] | None = None
+    result: str | None = None
 
     @classmethod
     def isolated(
@@ -129,6 +132,8 @@ class ExecutionContext(BaseModel):
         run_id: str,
         global_context: str = "",
         project_context: str = "",
+        system_prompt_override: str | None = None,
+        tool_whitelist: list[str] | None = None,
     ) -> ExecutionContext:
         return cls(
             mode=ExecutionMode.ISOLATED,
@@ -136,6 +141,8 @@ class ExecutionContext(BaseModel):
             goal=goal,
             global_context=global_context,
             project_context=project_context,
+            system_prompt_override=system_prompt_override,
+            tool_whitelist=tool_whitelist,
         )
 
     def llm_messages(self) -> list[AnthropicMessage]:
@@ -148,7 +155,7 @@ class ExecutionContext(BaseModel):
         return messages
 
     def system_prompt(self, base: str = BASE_SYSTEM_PROMPT) -> str:
-        parts = [base]
+        parts = [self.system_prompt_override or base]
         if self.global_context.strip():
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
         if self.project_context.strip():

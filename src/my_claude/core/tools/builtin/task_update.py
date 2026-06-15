@@ -21,9 +21,13 @@ class TaskUpdateTool:
     task_manager: TaskManager
 
     @property
+    def name(self) -> str:
+        return "task_update"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="task_update",
+            name=self.name,
             description=(
                 "Update a task's status or dependency list. Set status to "
                 "'in_progress' when starting work and 'completed' when finished. "

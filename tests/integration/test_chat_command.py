@@ -43,7 +43,7 @@ def test_chat_command_creates_session_sends_message_and_streams_response(
     ]
     assert "[chat] session sess-" in output
     assert "you> assistant> Local LLM placeholder accepted goal: hello" in output
-    assert "Registered tools: 9" in output
+    assert "Registered tools: 11" in output
     assert errors == ""
 
 

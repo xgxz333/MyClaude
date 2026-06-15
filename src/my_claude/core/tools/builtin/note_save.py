@@ -26,9 +26,13 @@ class NoteSaveTool:
     run_id: str = "manual"
 
     @property
+    def name(self) -> str:
+        return "note_save"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="note_save",
+            name=self.name,
             description=(
                 "Save a concise fact or decision to this session's notes. "
                 "These notes are visible in future turns of the same session."

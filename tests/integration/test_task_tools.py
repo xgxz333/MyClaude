@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from my_claude.core.config import AppConfig
+from my_claude.core.context import BASE_SYSTEM_PROMPT, ExecutionContext, ExecutionMode
 from my_claude.core.runner import AgentRunner, _build_registry, prepare_run_context
 from my_claude.core.task.manager import TaskManager
 
@@ -67,6 +68,66 @@ def test_prepare_run_context_creates_run_local_task_sandbox(tmp_path: Path) -> N
     assert second.tasks_dir == second.run_dir / ".tasks"
     assert second.tasks_dir.exists()
     assert first.tasks_dir != second.tasks_dir
+
+
+def test_prepare_run_context_applies_tool_whitelist(tmp_path: Path) -> None:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    execution_context = ExecutionContext(
+        mode=ExecutionMode.ISOLATED,
+        run_id="run-whitelist",
+        goal="create tasks only",
+        tool_whitelist=["task_create", "task_list"],
+    )
+
+    context = prepare_run_context(
+        "ignored",
+        config=config,
+        execution_context=execution_context,
+    )
+
+    assert [definition.name for definition in context.tools.definitions()] == [
+        "task_create",
+        "task_list",
+    ]
+
+
+def test_prepare_run_context_uses_system_prompt_override_as_base(tmp_path: Path) -> None:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    context = prepare_run_context(
+        "coordinate",
+        config=config,
+        run_id="run-prompt-override",
+        system_prompt_override="You are the coordinator.",
+    )
+
+    assert context.working_memory.system_prompt_patch is not None
+    assert context.working_memory.system_prompt_patch.startswith("You are the coordinator.")
+    assert BASE_SYSTEM_PROMPT not in context.working_memory.system_prompt_patch
+
+
+def test_agent_runner_run_and_capture_applies_tool_whitelist(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    outcome = asyncio.run(
+        AgentRunner(AppConfig(runs_dir=runs_dir, llm_provider="local")).run_and_capture(
+            "list tasks",
+            run_id="run-filtered",
+            tool_whitelist=["task_list"],
+        )
+    )
+
+    events = [
+        json.loads(line)
+        for line in (runs_dir / "run-filtered" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert outcome.status == "completed"
+    assert [
+        event["data"]["tools"]
+        for event in events
+        if event["type"] == "llm.request_started"
+    ] == [1]
 
 
 def test_agent_runner_run_and_capture_uses_named_run_sandbox(tmp_path: Path) -> None:

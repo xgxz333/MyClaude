@@ -43,9 +43,13 @@ class BashTool:
     max_output_bytes: int = MAX_OUTPUT_BYTES
 
     @property
+    def name(self) -> str:
+        return "bash"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="bash",
+            name=self.name,
             description=(
                 "Execute a non-interactive shell command from the workspace root. "
                 "Returns stdout, stderr, and exit status. Commands that wait for "

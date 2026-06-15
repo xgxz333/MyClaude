@@ -22,20 +22,24 @@ from my_claude.agent.events import (
 )
 from my_claude.agent.memory import RunStatus, WorkingMemory
 from my_claude.agent.tools import ToolRegistry
+from my_claude.core.agents import BackgroundTaskRegistry
 from my_claude.core.compaction import Compactor
 from my_claude.core.config import AppConfig
 from my_claude.core.context import AnthropicMessage, ExecutionContext
 from my_claude.core.events.bus import EventBus
 from my_claude.core.events.writer import JsonlEventWriter
+from my_claude.core.mcp import McpServerManager
 from my_claude.core.memory.loader import load_context_file
 from my_claude.core.permissions.manager import PermissionManager
 from my_claude.core.task.manager import TaskManager
 from my_claude.core.tools.base import BaseTool
 from my_claude.core.tools.builtin import (
+    AgentResultTool,
     BashTool,
     ListDirTool,
     NoteSaveTool,
     ReadFileTool,
+    SpawnAgentTool,
     TaskCreateTool,
     TaskGetTool,
     TaskListTool,
@@ -44,7 +48,7 @@ from my_claude.core.tools.builtin import (
 )
 from my_claude.core.trace.provider import EventBusTracingProvider, TracingProvider
 from my_claude.core.trace.writer import TraceWriter
-from my_claude.llm.client import create_llm_client
+from my_claude.llm.client import LLMClient, create_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,9 @@ class RunContext:
     tools: ToolRegistry
     loop_controller: LoopController
     permission_manager: PermissionManager | None = None
+    tool_whitelist: list[str] | None = None
+    background_tasks: BackgroundTaskRegistry = field(default_factory=BackgroundTaskRegistry)
+    mcp_manager: McpServerManager | None = None
 
 
 @dataclass(frozen=True)
@@ -97,10 +104,12 @@ class AgentRunner:
         *,
         listeners: Sequence[EventHandler] = (),
         trace_writer: TraceWriter | None = None,
+        mcp_manager: McpServerManager | None = None,
     ) -> None:
         self._config = config
         self._listeners = tuple(listeners)
         self._trace_writer = trace_writer
+        self._mcp_manager = mcp_manager
 
     async def run(self, goal: str, *, run_id: str | None = None) -> None:
         await self.run_and_capture(goal, run_id=run_id)
@@ -110,6 +119,8 @@ class AgentRunner:
         goal: str,
         *,
         run_id: str | None = None,
+        system_prompt_override: str | None = None,
+        tool_whitelist: list[str] | None = None,
     ) -> RunOutcome:
         global_ctx = load_context_file(Path("~/.myclaude/context.md"))
         project_ctx = load_context_file(Path(".myclaude/context.md"))
@@ -119,6 +130,9 @@ class AgentRunner:
             run_id=run_id,
             global_context=global_ctx,
             project_context=project_ctx,
+            system_prompt_override=system_prompt_override,
+            tool_whitelist=tool_whitelist,
+            mcp_manager=self._mcp_manager,
         )
         result = await run_prepared_context(
             context,
@@ -138,8 +152,9 @@ async def run_goal(
     config: AppConfig,
     listeners: Sequence[EventHandler] = (),
     trace_writer: TraceWriter | None = None,
+    mcp_manager: McpServerManager | None = None,
 ) -> RunResult:
-    context = prepare_run_context(goal, config=config)
+    context = prepare_run_context(goal, config=config, mcp_manager=mcp_manager)
     return await run_prepared_context(
         context,
         listeners=listeners,
@@ -215,6 +230,9 @@ def prepare_run_context(
     permission_manager: PermissionManager | None = None,
     global_context: str | None = None,
     project_context: str | None = None,
+    system_prompt_override: str | None = None,
+    tool_whitelist: list[str] | None = None,
+    mcp_manager: McpServerManager | None = None,
 ) -> RunContext:
     global_ctx = (
         load_context_file(Path("~/.myclaude/context.md"))
@@ -232,6 +250,16 @@ def prepare_run_context(
             update={
                 "global_context": global_ctx,
                 "project_context": project_ctx,
+                **(
+                    {"system_prompt_override": system_prompt_override}
+                    if system_prompt_override is not None
+                    else {}
+                ),
+                **(
+                    {"tool_whitelist": tool_whitelist}
+                    if tool_whitelist is not None
+                    else {}
+                ),
             }
         )
     else:
@@ -241,6 +269,8 @@ def prepare_run_context(
             run_id=run_id,
             global_context=global_ctx,
             project_context=project_ctx,
+            system_prompt_override=system_prompt_override,
+            tool_whitelist=tool_whitelist,
         )
     run_dir = _run_dir_for_execution_context(config, execution_context)
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -260,6 +290,8 @@ def prepare_run_context(
         permission_manager=permission_manager,
         event_bus=event_bus,
         session_id=execution_context.session_id,
+        tool_whitelist=execution_context.tool_whitelist,
+        mcp_manager=mcp_manager,
     )
     loop_controller = LoopController(max_iterations=config.agent_max_iterations)
     working_memory = WorkingMemory.from_execution_context(
@@ -282,6 +314,9 @@ def prepare_run_context(
         tools=tools,
         loop_controller=loop_controller,
         permission_manager=permission_manager,
+        tool_whitelist=execution_context.tool_whitelist,
+        background_tasks=BackgroundTaskRegistry(),
+        mcp_manager=mcp_manager,
     )
 
 
@@ -294,10 +329,17 @@ def _build_registry(
     permission_manager: PermissionManager | None = None,
     event_bus: EventBus[AgentEvent] | None = None,
     session_id: str | None = None,
+    tool_whitelist: Sequence[str] | None = None,
+    mcp_manager: McpServerManager | None = None,
 ) -> ToolRegistry:
     """Build the agent toolbox with one shared task manager instance."""
 
-    tools: list[BaseTool] = [
+    allowed: set[str] | None = set(tool_whitelist) if tool_whitelist else None
+
+    def _ok(name: str) -> bool:
+        return allowed is None or name in allowed
+
+    candidates: list[BaseTool] = [
         ReadFileTool(root=workspace_root),
         WriteFileTool(root=workspace_root),
         ListDirTool(root=workspace_root),
@@ -307,14 +349,19 @@ def _build_registry(
         TaskListTool(task_manager),
         TaskGetTool(task_manager),
     ]
+    tools = [tool for tool in candidates if _ok(tool.name)]
     if notes_path is not None:
         session_id = notes_path.parent.name
-        tools.append(
-            NoteSaveTool(
-                session_id=session_id,
-                notes_path=notes_path,
-                run_id=run_id or "manual",
-            )
+        note_save = NoteSaveTool(
+            session_id=session_id,
+            notes_path=notes_path,
+            run_id=run_id or "manual",
+        )
+        if _ok(note_save.name):
+            tools.append(note_save)
+    if mcp_manager is not None:
+        tools.extend(
+            mcp_tool for mcp_tool in mcp_manager.get_tools() if _ok(mcp_tool.name)
         )
 
     return ToolRegistry(
@@ -364,6 +411,7 @@ def _create_agent(context: RunContext, *, trace_writer: TraceWriter | None) -> A
             include_payload=context.config.trace_include_llm_payload,
             run_id=context.run_id,
         )
+    _register_subagent_tools(context, llm_client)
     session_dir = (
         context.config.runs_dir / "sessions" / context.session_id
         if context.session_id is not None
@@ -388,6 +436,64 @@ def _create_agent(context: RunContext, *, trace_writer: TraceWriter | None) -> A
         compactor=compactor,
         compact_threshold=context.config.compaction.auto_threshold,
     )
+
+
+def _register_subagent_tools(context: RunContext, llm_client: LLMClient) -> None:
+    allowed = set(context.tool_whitelist) if context.tool_whitelist else None
+
+    def build_child_registry(
+        child_bus: EventBus[AgentEvent],
+        child_run_id: str,
+        child_depth: int,
+        profile: object,
+    ) -> ToolRegistry:
+        profile_allowed_tools = getattr(profile, "allowed_tools", None)
+        child_registry = _build_registry(
+            TaskManager(context.config.runs_dir / child_run_id / ".tasks"),
+            workspace_root=Path.cwd(),
+            run_id=child_run_id,
+            permission_manager=context.permission_manager,
+            event_bus=child_bus,
+            tool_whitelist=profile_allowed_tools,
+            mcp_manager=context.mcp_manager,
+        )
+        child_allowed = set(profile_allowed_tools) if profile_allowed_tools else None
+        if child_allowed is None or "spawn_agent" in child_allowed:
+            child_registry.register(
+                SpawnAgentTool(
+                    llm_client=llm_client,
+                    workspace_root=Path.cwd(),
+                    max_steps=context.config.agent_max_iterations,
+                    parent_event_bus=child_bus,
+                    parent_run_id=child_run_id,
+                    depth=child_depth,
+                    background_registry=context.background_tasks,
+                    child_registry_builder=build_child_registry,
+                    run_id_factory=new_run_id,
+                )
+            )
+        if child_allowed is None or "agent_result" in child_allowed:
+            child_registry.register(
+                AgentResultTool(background_registry=context.background_tasks)
+            )
+        return child_registry
+
+    if allowed is None or "spawn_agent" in allowed:
+        context.tools.register(
+            SpawnAgentTool(
+                llm_client=llm_client,
+                workspace_root=Path.cwd(),
+                max_steps=context.config.agent_max_iterations,
+                parent_event_bus=context.event_bus,
+                parent_run_id=context.run_id,
+                depth=0,
+                background_registry=context.background_tasks,
+                child_registry_builder=build_child_registry,
+                run_id_factory=new_run_id,
+            )
+        )
+    if allowed is None or "agent_result" in allowed:
+        context.tools.register(AgentResultTool(background_registry=context.background_tasks))
 
 
 async def _handle_run_interruption(context: RunContext) -> None:

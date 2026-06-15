@@ -23,9 +23,13 @@ class WriteFileTool:
     max_bytes: int = DEFAULT_MAX_BYTES
 
     @property
+    def name(self) -> str:
+        return "write_file"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="write_file",
+            name=self.name,
             description=(
                 "Write UTF-8 text to a file under the workspace root. Creates parent "
                 "directories as needed and overwrites existing files."

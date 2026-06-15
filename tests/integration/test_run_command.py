@@ -154,7 +154,7 @@ def test_agent_run_route_uses_one_shot_session_adapter(tmp_path: Path) -> None:
     assistant_content = cast(list[dict[str, object]], turns[1]["content"])
     assistant_text = cast(str, assistant_content[0]["text"])
     assert "Local LLM placeholder accepted goal: explain the adapter" in assistant_text
-    assert "Registered tools: 9" in assistant_text
+    assert "Registered tools: 11" in assistant_text
 
 
 async def _agent_run_returns_before_background_finish(

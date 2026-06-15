@@ -20,9 +20,13 @@ class TaskCreateTool:
     task_manager: TaskManager
 
     @property
+    def name(self) -> str:
+        return "task_create"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="task_create",
+            name=self.name,
             description=(
                 "Create a new task to track a unit of work. Use this to break a "
                 "complex goal into smaller, trackable steps. Returns JSON."

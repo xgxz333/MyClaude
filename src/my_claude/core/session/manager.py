@@ -17,6 +17,7 @@ from my_claude.agent.events import (
     SessionMessageReceivedEvent,
     SessionResumedEvent,
     SessionWaitingForInputEvent,
+    SkillInvokedEvent,
 )
 from my_claude.core.bus.command import HandlerError
 from my_claude.core.compaction import Compactor
@@ -36,6 +37,7 @@ from my_claude.core.session.store import (
     SessionStore,
     SessionTurn,
 )
+from my_claude.core.skills import SkillLoader
 from my_claude.llm.client import LLMClient
 
 
@@ -90,6 +92,7 @@ class SessionManager:
         self._store = SessionStore(runs_dir)
         self._bus = bus
         self._compact_provider_factory = compact_provider_factory
+        self._skill_loader = SkillLoader()
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -165,14 +168,40 @@ class SessionManager:
                     content=normalized_message,
                 )
             )
+            goal = normalized_message
+            system_prompt_override: str | None = None
+            tool_whitelist: list[str] | None = None
+            llm_timeline: list[SessionTurn] | None = None
+            if normalized_message.startswith("/"):
+                command = normalized_message.removeprefix("/")
+                command_parts = command.split(None, 1)
+                skill_name = command_parts[0] if command_parts else ""
+                arguments = command_parts[1] if len(command_parts) > 1 else ""
+                skill = self._skill_loader.resolve(skill_name) if skill_name else None
+                if skill is not None:
+                    goal = self._skill_loader.render_prompt(skill, arguments)
+                    system_prompt_override = skill.system_prompt_template
+                    tool_whitelist = skill.allowed_tools or None
+                    await self._bus.publish(
+                        SkillInvokedEvent(
+                            skill_name=skill.name,
+                            arguments=arguments,
+                            session_id=session.session_id,
+                            run_id=run_id,
+                        )
+                    )
             full_timeline = self._store.read_messages(session.session_id)
+            if goal != normalized_message:
+                llm_timeline = _replace_latest_user_turn_content(full_timeline, goal)
             notes = [*session.notes, *self._store.read_notes(session.session_id)]
             execution_context = _build_execution_context(
                 session,
-                goal=normalized_message,
+                goal=goal,
                 run_id=run_id,
-                turns=full_timeline,
+                turns=llm_timeline or full_timeline,
                 notes=notes,
+                system_prompt_override=system_prompt_override,
+                tool_whitelist=tool_whitelist,
             )
             return SessionMessageOutcome(
                 session=session,
@@ -391,6 +420,8 @@ def _build_execution_context(
     run_id: str,
     turns: list[SessionTurn] | None = None,
     notes: list[SessionNote] | None = None,
+    system_prompt_override: str | None = None,
+    tool_whitelist: list[str] | None = None,
 ) -> ExecutionContext:
     return ExecutionContext(
         mode=ExecutionMode.SESSION,
@@ -405,7 +436,27 @@ def _build_execution_context(
             SemanticMemoryItem(kind=note.kind, content=note.content)
             for note in (notes if notes is not None else session.notes)
         ],
+        system_prompt_override=system_prompt_override,
+        tool_whitelist=tool_whitelist,
     )
+
+
+def _replace_latest_user_turn_content(
+    turns: list[SessionTurn],
+    content: str,
+) -> list[SessionTurn]:
+    updated = list(turns)
+    for index in range(len(updated) - 1, -1, -1):
+        turn = updated[index]
+        if turn.role == "user":
+            updated[index] = SessionTurn(
+                role=turn.role,
+                content=content,
+                run_id=turn.run_id,
+                created_at=turn.created_at,
+            )
+            break
+    return updated
 
 
 def _turn_to_message(turn: SessionTurn) -> AnthropicMessage:

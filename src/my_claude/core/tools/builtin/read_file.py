@@ -24,9 +24,13 @@ class ReadFileTool:
     max_chars: int = DEFAULT_MAX_CHARS
 
     @property
+    def name(self) -> str:
+        return "read_file"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="read_file",
+            name=self.name,
             description="Read a UTF-8 text file under the workspace root.",
             input_schema={
                 "type": "object",

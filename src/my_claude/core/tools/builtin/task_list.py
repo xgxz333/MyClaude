@@ -19,9 +19,13 @@ class TaskListTool:
     task_manager: TaskManager
 
     @property
+    def name(self) -> str:
+        return "task_list"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="task_list",
+            name=self.name,
             description=(
                 "List all tasks with current status and blocking dependencies. "
                 "Use this to check what work remains and what can start next."

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
 class AgentEventType(StrEnum):
@@ -35,6 +36,9 @@ class AgentEventType(StrEnum):
     SESSION_WAITING_FOR_INPUT = "session.waiting_for_input"
     SESSION_RESUMED = "session.resumed"
     SESSION_CLOSED = "session.closed"
+    SKILL_INVOKED = "skill.invoked"
+    SUB_AGENT_STARTED = "subagent.started"
+    SUB_AGENT_FINISHED = "subagent.finished"
 
 
 class AgentEvent(BaseModel):
@@ -307,6 +311,51 @@ class SessionClosedEvent(AgentEvent):
     session_id: str
 
 
+class SkillInvokedEvent(AgentEvent):
+    """Event emitted when a slash command resolves to a skill."""
+
+    type: Literal[AgentEventType.SKILL_INVOKED] = AgentEventType.SKILL_INVOKED
+    message: str = "skill invoked"
+    skill_name: str
+    arguments: str
+    session_id: str | None = None
+    run_id: str | None = None
+
+
+def _timestamp() -> float:
+    return time.time()
+
+
+class SubagentStartedEvent(AgentEvent):
+    """Event emitted when a parent agent starts a child agent."""
+
+    type: Literal[AgentEventType.SUB_AGENT_STARTED] = AgentEventType.SUB_AGENT_STARTED
+    message: str = "subagent started"
+    run_id: str
+    parent_run_id: str
+    description: str
+    subagent_type: str | None = None
+    ts: float = Field(default_factory=_timestamp)
+
+
+class SubagentFinishedEvent(AgentEvent):
+    """Event emitted when a child agent finishes."""
+
+    type: Literal[AgentEventType.SUB_AGENT_FINISHED] = AgentEventType.SUB_AGENT_FINISHED
+    message: str = "subagent finished"
+    run_id: str
+    parent_run_id: str
+    description: str
+    subagent_type: str | None = None
+    result: str | None = None
+    is_error: bool = False
+    ts: float = Field(default_factory=_timestamp)
+
+
+SubAgentStartedEvent = SubagentStartedEvent
+SubAgentFinishedEvent = SubagentFinishedEvent
+
+
 KnownAgentEvent = (
     RunStartedEvent
     | StepStartedEvent
@@ -331,6 +380,9 @@ KnownAgentEvent = (
     | SessionWaitingForInputEvent
     | SessionResumedEvent
     | SessionClosedEvent
+    | SkillInvokedEvent
+    | SubagentStartedEvent
+    | SubagentFinishedEvent
 )
 
 KnownAgentEventAdapter: TypeAdapter[KnownAgentEvent] = TypeAdapter(KnownAgentEvent)

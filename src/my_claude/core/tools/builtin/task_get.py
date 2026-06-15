@@ -20,9 +20,13 @@ class TaskGetTool:
     task_manager: TaskManager
 
     @property
+    def name(self) -> str:
+        return "task_get"
+
+    @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
-            name="task_get",
+            name=self.name,
             description="Get full details of a task by integer ID. Returns JSON.",
             input_schema={
                 "type": "object",
