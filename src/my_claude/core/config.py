@@ -15,6 +15,16 @@ DEFAULT_ENV_FILE = Path(".env")
 ENV_PREFIX = "MYCLAUDE_"
 
 
+class CompactionConfig(BaseModel):
+    """Configuration for context compaction behavior."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    auto_threshold: float = 0.0
+    tool_result_limit: int = 8_000
+    tool_result_keep: int = 4_000
+
+
 class AppConfig(BaseModel):
     """Validated runtime settings shared by CLI, core server, and agent runner."""
 
@@ -40,6 +50,7 @@ class AppConfig(BaseModel):
     trace_enabled: bool = True
     trace_file: Path | None = None
     trace_include_llm_payload: bool = True
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
 
 
 def load_config(
@@ -66,7 +77,11 @@ def _load_toml_config(config_file: Path) -> dict[str, Any]:
     if not isinstance(section, dict):
         return {}
 
-    return dict(section)
+    values = dict(section)
+    compaction = data.get("compaction")
+    if "compaction" not in values and isinstance(compaction, dict):
+        values["compaction"] = compaction
+    return values
 
 
 def _load_env_file(env_file: Path) -> dict[str, Any]:

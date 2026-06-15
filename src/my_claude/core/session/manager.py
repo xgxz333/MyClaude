@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,9 @@ from my_claude.agent.events import (
     SessionResumedEvent,
     SessionWaitingForInputEvent,
 )
+from my_claude.core.bus.command import HandlerError
+from my_claude.core.compaction import Compactor
+from my_claude.core.compaction.compactor import COMPACTION_ASSISTANT_ACK
 from my_claude.core.context import (
     AnthropicMessage,
     ExecutionContext,
@@ -32,6 +36,7 @@ from my_claude.core.session.store import (
     SessionStore,
     SessionTurn,
 )
+from my_claude.llm.client import LLMClient
 
 
 def _now() -> str:
@@ -57,6 +62,17 @@ class SessionMessageOutcome:
     path: Path
 
 
+@dataclass(frozen=True)
+class SessionCompactOutcome:
+    """Metadata returned after manually compacting a session thread."""
+
+    session_id: str
+    thread_path: Path
+    backup_path: Path
+    summary_tokens: int
+    saved_tokens: int
+
+
 class SessionBusyError(ValueError):
     """Raised when a session is already handling another operation."""
 
@@ -64,9 +80,16 @@ class SessionBusyError(ValueError):
 class SessionManager:
     """Maintain daemon-side chat sessions in memory, on disk, and on the event bus."""
 
-    def __init__(self, runs_dir: Path, bus: EventBus[AgentEvent]) -> None:
+    def __init__(
+        self,
+        runs_dir: Path,
+        bus: EventBus[AgentEvent],
+        *,
+        compact_provider_factory: Callable[[], LLMClient] | None = None,
+    ) -> None:
         self._store = SessionStore(runs_dir)
         self._bus = bus
+        self._compact_provider_factory = compact_provider_factory
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -261,6 +284,73 @@ class SessionManager:
         finally:
             lock.release()
 
+    async def compact(
+        self,
+        session_id: str,
+        *,
+        focus: str = "",
+    ) -> SessionCompactOutcome:
+        """Manually compact a persisted session thread after backing it up."""
+
+        lock = self._require_lock(session_id)
+        if lock.locked():
+            raise SessionBusyError(f"session busy: {session_id}")
+
+        await lock.acquire()
+        try:
+            session = self._require(session_id)
+            if session.active_run_id is not None:
+                raise SessionBusyError(
+                    f"session busy: {session_id} active run {session.active_run_id}"
+                )
+            messages = self._store.read_messages(session_id)
+            if not messages:
+                raise HandlerError(-32021, "compaction failed or not beneficial")
+            provider = self._compact_provider()
+            compactor = Compactor(
+                self._bus,
+                self._store.session_dir(session_id),
+                session_id,
+                llm_client=provider,
+            )
+            result = await compactor.compact_messages(
+                [_turn_to_message(turn) for turn in messages],
+                provider,
+                focus=focus,
+            )
+            if result is None:
+                raise HandlerError(-32021, "compaction failed or not beneficial")
+
+            compacted_messages = [
+                SessionTurn(role="user", content=result.summary_text),
+                SessionTurn(role="assistant", content=COMPACTION_ASSISTANT_ACK),
+            ]
+            try:
+                thread_path, backup_path = self._store.write_compacted(
+                    session_id,
+                    compacted_messages,
+                )
+            except ValueError as error:
+                raise HandlerError(
+                    -32021,
+                    "compaction failed or not beneficial",
+                ) from error
+            session.turns = compacted_messages
+            session.updated_at = _now()
+            self._store.write_meta(session)
+            return SessionCompactOutcome(
+                session_id=session_id,
+                thread_path=thread_path,
+                backup_path=backup_path,
+                summary_tokens=result.summary_tokens,
+                saved_tokens=max(
+                    0,
+                    result.original_token_estimate - result.summary_tokens,
+                ),
+            )
+        finally:
+            lock.release()
+
     def _require(self, session_id: str) -> Session:
         session = self._sessions.get(session_id)
         if session is not None:
@@ -287,6 +377,11 @@ class SessionManager:
         lock = asyncio.Lock()
         self._locks[session_id] = lock
         return lock
+
+    def _compact_provider(self) -> LLMClient:
+        if self._compact_provider_factory is None:
+            raise HandlerError(-32020, "provider not available for compaction")
+        return self._compact_provider_factory()
 
 
 def _build_execution_context(

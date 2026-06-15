@@ -20,6 +20,7 @@ class AgentEventType(StrEnum):
     LLM_USAGE = "llm.usage"
     LLM_MODEL_SELECTED = "llm.model_selected"
     LLM_RESPONSE_COMPLETED = "llm.response_completed"
+    CONTEXT_COMPACTED = "context.compacted"
     TOOL_CALL_STARTED = "tool.call_started"
     TOOL_CALL_FAILED = "tool.call_failed"
     TOOL_CALL_COMPLETED = "tool.call_finished"
@@ -110,6 +111,7 @@ class LLMUsageEvent(AgentEvent):
     output_tokens: int
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    context_pct: float = 0.0
 
 
 class LLMModelSelectedEvent(AgentEvent):
@@ -120,6 +122,18 @@ class LLMModelSelectedEvent(AgentEvent):
     run_id: str
     model: str
     strategy: str = "static"
+
+
+class ContextCompactedEvent(AgentEvent):
+    """Event emitted after in-memory run context is compacted."""
+
+    type: Literal[AgentEventType.CONTEXT_COMPACTED] = AgentEventType.CONTEXT_COMPACTED
+    message: str = "context compacted"
+    session_id: str
+    run_id: str
+    original_tokens: int
+    summary_tokens: int
+    ts: str
 
 
 class LLMResponseCompletedEvent(AgentEvent):
@@ -301,6 +315,7 @@ KnownAgentEvent = (
     | LLMTokenEvent
     | LLMUsageEvent
     | LLMModelSelectedEvent
+    | ContextCompactedEvent
     | LLMResponseCompletedEvent
     | ToolCallStartedEvent
     | ToolCallFailedEvent

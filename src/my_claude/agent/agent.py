@@ -16,7 +16,7 @@ from my_claude.agent.events import (
 )
 from my_claude.agent.memory import RunStatus, WorkingMemory
 from my_claude.agent.tools import ToolRegistry
-from my_claude.core.loop import AgentLoop
+from my_claude.core.loop import AgentLoop, Compactor
 from my_claude.llm.client import LLMClient
 
 
@@ -39,12 +39,16 @@ class Agent:
         working_memory: WorkingMemory | None = None,
         loop_controller: LoopController | None = None,
         event_handler: EventHandler | None = None,
+        compactor: Compactor | None = None,
+        compact_threshold: float = 0.0,
     ) -> None:
         self._llm_client = llm_client
         self._tools = tools
         self._working_memory = working_memory
         self._loop_controller = loop_controller or LoopController()
         self._event_handler = event_handler
+        self._compactor = compactor
+        self._compact_threshold = compact_threshold
 
     async def run(
         self,
@@ -69,6 +73,8 @@ class Agent:
                 working_memory=working_memory,
                 loop_controller=self._loop_controller,
                 event_handler=self._event_handler,
+                compactor=self._compactor,
+                compact_threshold=self._compact_threshold,
             )
             result = await loop.run()
             return AgentResult(goal=run_goal, final_response=result.final_response)
@@ -79,7 +85,7 @@ class Agent:
                     reason="agent run cancelled",
                     transition_reason="async cancellation requested",
                 )
-                await self._emit(RunCancelledEvent())
+                await self._emit(RunCancelledEvent(run_id=working_memory.run_id))
             raise
         except Exception as error:
             if working_memory.status != RunStatus.FAILED:
@@ -88,7 +94,13 @@ class Agent:
                     reason=str(error),
                     transition_reason="agent loop raised an exception",
                 )
-                await self._emit(RunFailedEvent(message=str(error), error=str(error)))
+                await self._emit(
+                    RunFailedEvent(
+                        message=str(error),
+                        error=str(error),
+                        run_id=working_memory.run_id,
+                    )
+                )
             raise
 
     async def _emit(self, event: AgentEvent) -> None:

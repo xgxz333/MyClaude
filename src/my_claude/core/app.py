@@ -17,6 +17,7 @@ from my_claude.core.bus.command import (
     EVENT_SUBSCRIBE_METHOD,
     PERMISSION_RESPOND_METHOD,
     SESSION_CLOSE_METHOD,
+    SESSION_COMPACT_METHOD,
     SESSION_CREATE_METHOD,
     SESSION_GET_HISTORY_METHOD,
     SESSION_MESSAGE_METHOD,
@@ -30,6 +31,8 @@ from my_claude.core.bus.command import (
     PermissionRespondResult,
     SessionCloseCommand,
     SessionCloseResult,
+    SessionCompactCommand,
+    SessionCompactResult,
     SessionCreateCommand,
     SessionCreateResult,
     SessionGetHistoryCommand,
@@ -59,6 +62,7 @@ from my_claude.core.trace.paths import DAEMON_TRACE_FILENAME
 from my_claude.core.trace.writer import TraceWriter
 from my_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from my_claude.core.transport.socket_server import TCPServer, current_tcp_connection
+from my_claude.llm.client import create_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +91,15 @@ def register_routes(
         timeout_s=runtime_config.permission_timeout_s,
     )
     active_run_tasks: set[asyncio.Task[RunResult]] = run_tasks if run_tasks is not None else set()
-    session_manager = SessionManager(runtime_config.runs_dir, daemon_event_bus)
+    session_manager = SessionManager(
+        runtime_config.runs_dir,
+        daemon_event_bus,
+        compact_provider_factory=lambda: create_llm_client(
+            runtime_config,
+            event_handler=None,
+            run_id="compact",
+        ),
+    )
 
     async def handle_core_ping(_request: JsonRpcRequest) -> BusResult:
         return ping_result(
@@ -219,14 +231,11 @@ def register_routes(
             trace_writer=trace_emitter,
             run_tasks=active_run_tasks,
         )
-        try:
-            await run_task
-        finally:
-            await session_manager.finish_message(
-                session_id=message_outcome.session.session_id,
-                task=run_task,
-                prefill_messages=message_outcome.prefill_messages,
-            )
+        _persist_session_result_when_done(
+            run_task,
+            session_manager=session_manager,
+            message_outcome=message_outcome,
+        )
         return SessionSendMessageResult(run_id=context.run_id)
 
     async def handle_session_get_history(request: JsonRpcRequest) -> BusResult:
@@ -236,6 +245,20 @@ def register_routes(
 
         return SessionGetHistoryResult(
             messages=await session_manager.get_history(command.params.session_id)
+        )
+
+    async def handle_session_compact(request: JsonRpcRequest) -> BusResult:
+        command = command_from_request(request)
+        if not isinstance(command, SessionCompactCommand):
+            raise ValueError("session.compact params are invalid")
+
+        outcome = await session_manager.compact(
+            command.params.session_id,
+            focus=command.params.focus,
+        )
+        return SessionCompactResult(
+            summary_tokens=outcome.summary_tokens,
+            saved_tokens=outcome.saved_tokens,
         )
 
     async def handle_session_close(request: JsonRpcRequest) -> BusResult:
@@ -261,6 +284,7 @@ def register_routes(
     server.register(SESSION_MESSAGE_METHOD, handle_session_message)
     server.register(SESSION_SEND_MESSAGE_METHOD, handle_session_send_message)
     server.register(SESSION_GET_HISTORY_METHOD, handle_session_get_history)
+    server.register(SESSION_COMPACT_METHOD, handle_session_compact)
     server.register(SESSION_CLOSE_METHOD, handle_session_close)
     server.register(PERMISSION_RESPOND_METHOD, handle_permission_respond)
 

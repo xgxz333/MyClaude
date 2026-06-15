@@ -82,8 +82,10 @@ def test_socket_frame_dispatcher_sets_jsonrpc_error_on_pending_request() -> None
             )
         )
 
-        with pytest.raises(SocketClientError, match="bad params"):
+        with pytest.raises(SocketClientError, match="bad params") as exc_info:
             await response_future
+        assert exc_info.value.code == JsonRpcErrorCode.INVALID_PARAMS
+        assert exc_info.value.data == {"field": "goal"}
 
     asyncio.run(dispatch_error())
 

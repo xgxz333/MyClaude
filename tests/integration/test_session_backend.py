@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -13,25 +13,60 @@ from my_claude.core.app import register_routes
 from my_claude.core.bus.command import (
     EVENT_SUBSCRIBE_METHOD,
     SESSION_CLOSE_METHOD,
+    SESSION_COMPACT_METHOD,
     SESSION_CREATE_METHOD,
     SESSION_GET_HISTORY_METHOD,
     SESSION_SEND_MESSAGE_METHOD,
 )
+from my_claude.core.bus.envelope import (
+    JsonRpcErrorResponse,
+    JsonRpcRequest,
+    parse_response,
+    to_ndjson,
+)
 from my_claude.core.config import AppConfig
-from my_claude.core.context import ExecutionContext, ExecutionMode, SemanticMemoryKind
+from my_claude.core.context import (
+    BASE_SYSTEM_PROMPT,
+    AnthropicMessage,
+    ExecutionContext,
+    ExecutionMode,
+    SemanticMemoryKind,
+)
 from my_claude.core.events.bus import EventBus
 from my_claude.core.session.manager import (
     SessionBusyError,
     SessionManager,
 )
 from my_claude.core.session.store import (
+    TOOL_RESULT_KEEP,
+    TOOL_RESULT_LIMIT,
     Session,
     SessionStore,
     SessionTurn,
+    truncate_tool_results,
 )
 from my_claude.core.tools.builtin.note_save import NoteSaveTool
 from my_claude.core.transport.socket_client import SocketClient
 from my_claude.core.transport.socket_server import TCPServer
+from my_claude.llm.client import LLMResponse, LLMUsage
+
+
+class CompactProvider:
+    def __init__(self, summary: str) -> None:
+        self.summary = summary
+        self.messages: Sequence[AnthropicMessage] | None = None
+
+    async def complete(
+        self,
+        messages: Sequence[AnthropicMessage],
+        tools: Sequence[object],
+        *,
+        step: int | None = None,
+        system_prompt_patch: str | None = None,
+    ) -> LLMResponse:
+        del tools, step, system_prompt_patch
+        self.messages = messages
+        return LLMResponse(content=self.summary, usage=LLMUsage(output_tokens=17))
 
 
 def test_session_manager_create_initializes_memory_lock_disk_and_event(
@@ -97,6 +132,26 @@ def test_kama_session_ipc_create_send_history_close(tmp_path: Path) -> None:
     assert result["closed"] == {"status": "closed"}
 
 
+def test_session_compact_ipc_rewrites_future_history(tmp_path: Path) -> None:
+    result = asyncio.run(_session_compact_ipc_roundtrip(tmp_path))
+
+    assert result["compact"]["summary_tokens"] > 0
+    assert result["compact"]["saved_tokens"] >= 0
+    assert result["backup_exists"] is True
+    messages = result["history"]["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert "Local LLM placeholder accepted goal" in messages[0]["content"]
+    assert messages[1]["content"] == "Understood, I'll continue from this summary."
+
+
+def test_session_compact_ipc_returns_compaction_error_code(tmp_path: Path) -> None:
+    response = asyncio.run(_session_compact_empty_session_error(tmp_path))
+
+    assert isinstance(response, JsonRpcErrorResponse)
+    assert response.error.code == -32021
+    assert response.error.message == "compaction failed or not beneficial"
+
+
 def test_session_message_writes_context_before_run_and_busy_fails_fast(
     tmp_path: Path,
 ) -> None:
@@ -137,10 +192,11 @@ def test_session_message_restores_execution_context_from_persistent_session(
         (SemanticMemoryKind.FACT, "repo uses uv"),
         (SemanticMemoryKind.DECISION, "busy sessions fail fast"),
     ]
-    system_prompt_patch = execution_context.system_prompt_patch()
-    assert system_prompt_patch is not None
-    assert system_prompt_patch.startswith("## Session Notes")
-    assert "fact: repo uses uv" in system_prompt_patch
+    assert execution_context.system_prompt_patch() is not None
+    system_prompt = execution_context.system_prompt()
+    assert system_prompt.startswith(BASE_SYSTEM_PROMPT)
+    assert "## Session Notes" in system_prompt
+    assert "fact: repo uses uv" in system_prompt
     llm_messages = execution_context.llm_messages()
     assert llm_messages[0].text == "old question"
     assert llm_messages[-1].text == "new question"
@@ -189,6 +245,187 @@ def test_session_store_append_messages_preserves_existing_history(
         "first",
         "second",
         "third",
+    ]
+
+
+def test_truncate_tool_results_returns_copied_messages_without_mutating_input() -> None:
+    long_output = "x" * (TOOL_RESULT_LIMIT + 10)
+    message = SessionTurn(
+        role="user",
+        content=[
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": long_output,
+            },
+            {"type": "text", "text": "unchanged"},
+        ],
+    )
+
+    truncated = truncate_tool_results([message])
+
+    assert truncated != [message]
+    assert truncated[0] is not message
+    original_block = message.content[0]
+    truncated_block = truncated[0].content[0]
+    assert original_block["content"] == long_output
+    assert truncated_block["content"].startswith("x" * TOOL_RESULT_KEEP)
+    assert (
+        f"[... {len(long_output) - TOOL_RESULT_KEEP} chars omitted. Full output in run events.]"
+        in truncated_block["content"]
+    )
+    assert truncated[0].content[1] == {"type": "text", "text": "unchanged"}
+
+
+def test_truncate_tool_results_accepts_anthropic_message_dicts() -> None:
+    long_output = "y" * (TOOL_RESULT_LIMIT + 1)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": long_output,
+                }
+            ],
+        }
+    ]
+
+    truncated = truncate_tool_results(messages)
+
+    assert truncated is not messages
+    assert truncated[0] is not messages[0]
+    assert messages[0]["content"][0]["content"] == long_output
+    assert truncated[0]["content"][0]["content"].startswith("y" * TOOL_RESULT_KEEP)
+    assert "Full output in run events." in truncated[0]["content"][0]["content"]
+
+
+def test_session_store_truncates_tool_results_only_when_reading_memory(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "runs")
+    long_output = "tool-output-" * 900
+    session = Session(
+        session_id="sess-tool-result-truncate",
+        turns=[
+            SessionTurn(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "bash",
+                        "input": {"cmd": "generate output"},
+                    }
+                ],
+            ),
+            SessionTurn(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": long_output,
+                    }
+                ],
+            ),
+        ],
+    )
+    store.write_meta(session)
+
+    messages = store.read_messages(session.session_id)
+
+    tool_result = messages[1].content[0]
+    assert len(tool_result["content"]) < len(long_output)
+    assert tool_result["content"].startswith(long_output[:TOOL_RESULT_KEEP])
+    assert "Full output in run events." in tool_result["content"]
+    thread_text = store.thread_path_for(session.session_id).read_text(encoding="utf-8")
+    assert long_output in thread_text
+    assert "Full output in run events." not in thread_text
+
+
+def test_session_store_write_compacted_backs_up_and_replaces_thread(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "runs")
+    session = Session(
+        session_id="sess-write-compact",
+        turns=[
+            SessionTurn(role="user", content="old question"),
+            SessionTurn(role="assistant", content="old answer"),
+        ],
+    )
+    store.write_meta(session)
+    original_thread = store.thread_path_for(session.session_id).read_text(encoding="utf-8")
+
+    thread_path, backup_path = store.write_compacted(
+        session.session_id,
+        [
+            SessionTurn(role="user", content="summary"),
+            SessionTurn(role="assistant", content="Understood"),
+        ],
+    )
+
+    assert backup_path.exists()
+    assert backup_path.read_text(encoding="utf-8") == original_thread
+    assert thread_path == store.thread_path_for(session.session_id)
+    turns = store.read_messages(session.session_id)
+    assert [turn.content for turn in turns] == ["summary", "Understood"]
+
+
+def test_session_manager_compact_rewrites_thread_and_future_history(
+    tmp_path: Path,
+) -> None:
+    summary = "\n".join(
+        [
+            "## 1. Original Goal",
+            "Keep the goal.",
+            "## 2. Completed Steps",
+            "Compacted.",
+            "## 3. Key Constraints & Discoveries",
+            "Keep tests.",
+            "## 4. Current File State",
+            "Thread rewritten.",
+            "## 5. Remaining TODOs",
+            "Continue.",
+            "## 6. Critical Data",
+            "thread.jsonl backed up.",
+        ]
+    )
+    provider = CompactProvider(summary)
+    manager = SessionManager(
+        tmp_path / "runs",
+        EventBus(),
+        compact_provider_factory=lambda: provider,
+    )
+    store = manager._store
+    session = Session(
+        session_id="sess-compact",
+        turns=[
+            SessionTurn(role="user", content="original goal"),
+            SessionTurn(role="assistant", content="finished setup"),
+        ],
+    )
+    store.write_meta(session)
+    original_thread = store.thread_path_for(session.session_id).read_text(encoding="utf-8")
+
+    outcome = asyncio.run(
+        manager.compact(
+            session.session_id,
+            focus="重点保留测试失败信息",
+        )
+    )
+
+    assert outcome.session_id == session.session_id
+    assert outcome.summary_tokens > 0
+    assert outcome.saved_tokens >= 0
+    assert outcome.backup_path.read_text(encoding="utf-8") == original_thread
+    assert provider.messages is not None
+    assert "重点保留测试失败信息" in provider.messages[0].text
+    assert [turn.content for turn in manager.read_messages(session.session_id)] == [
+        summary,
+        "Understood, I'll continue from this summary.",
     ]
 
 
@@ -348,6 +585,16 @@ async def _kama_session_ipc_roundtrip(tmp_path: Path) -> dict[str, Any]:
             _bound_port(server),
             timeout_seconds=1.0,
         ) as client:
+            pushed_events: list[dict[str, Any]] = []
+
+            async def collect_event(event: dict[str, Any]) -> None:
+                pushed_events.append(event)
+
+            client.on_event(collect_event)
+            await client.request(
+                EVENT_SUBSCRIBE_METHOD,
+                {"topics": ["session.*"], "scope": "global"},
+            )
             created = await client.request(
                 SESSION_CREATE_METHOD,
                 {"mode": "chat", "title": "ipc test"},
@@ -356,6 +603,13 @@ async def _kama_session_ipc_roundtrip(tmp_path: Path) -> dict[str, Any]:
             send = await client.request(
                 SESSION_SEND_MESSAGE_METHOD,
                 {"session_id": session_id, "content": "hello"},
+            )
+            await _wait_until(
+                lambda: any(
+                    event.get("type") == "session.waiting_for_input"
+                    and event.get("last_run_id") == send["run_id"]
+                    for event in pushed_events
+                )
             )
             history = await client.request(
                 SESSION_GET_HISTORY_METHOD,
@@ -371,6 +625,104 @@ async def _kama_session_ipc_roundtrip(tmp_path: Path) -> dict[str, Any]:
                 "history": history,
                 "closed": closed,
             }
+    finally:
+        await server.shutdown()
+
+
+async def _session_compact_ipc_roundtrip(tmp_path: Path) -> dict[str, Any]:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(server, config=config, server_version="test-version")
+
+    await server.start()
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            pushed_events: list[dict[str, Any]] = []
+
+            async def collect_event(event: dict[str, Any]) -> None:
+                pushed_events.append(event)
+
+            client.on_event(collect_event)
+            await client.request(
+                EVENT_SUBSCRIBE_METHOD,
+                {"topics": ["session.*"], "scope": "global"},
+            )
+            created = await client.request(
+                SESSION_CREATE_METHOD,
+                {"mode": "chat", "title": "compact ipc"},
+            )
+            session_id = str(created["session_id"])
+            send = await client.request(
+                SESSION_SEND_MESSAGE_METHOD,
+                {"session_id": session_id, "content": "hello compact"},
+            )
+            await _wait_until(
+                lambda: any(
+                    event.get("type") == "session.waiting_for_input"
+                    and event.get("last_run_id") == send["run_id"]
+                    for event in pushed_events
+                )
+            )
+            compact = await client.request(
+                SESSION_COMPACT_METHOD,
+                {
+                    "session_id": session_id,
+                    "focus": "重点保留当前文件状态",
+                },
+            )
+            backup_exists = bool(
+                list((config.runs_dir / "sessions" / session_id).glob("thread_*.jsonl.bak"))
+            )
+            history = await client.request(
+                SESSION_GET_HISTORY_METHOD,
+                {"session_id": session_id},
+            )
+            return {
+                "compact": compact,
+                "history": history,
+                "backup_exists": backup_exists,
+            }
+    finally:
+        await server.shutdown()
+
+
+async def _session_compact_empty_session_error(tmp_path: Path) -> object:
+    config = AppConfig(runs_dir=tmp_path / "runs", llm_provider="local")
+    server = TCPServer("127.0.0.1", 0, max_request_bytes=config.max_request_bytes)
+    register_routes(server, config=config, server_version="test-version")
+
+    await server.start()
+    try:
+        async with SocketClient(
+            "127.0.0.1",
+            _bound_port(server),
+            timeout_seconds=1.0,
+        ) as client:
+            created = await client.request(
+                SESSION_CREATE_METHOD,
+                {"mode": "chat", "title": "empty compact"},
+            )
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", _bound_port(server))
+        try:
+            writer.write(
+                to_ndjson(
+                    JsonRpcRequest(
+                        id=1,
+                        method=SESSION_COMPACT_METHOD,
+                        params={"session_id": str(created["session_id"])},
+                    )
+                )
+            )
+            await writer.drain()
+            return parse_response(await reader.readuntil(b"\n"))
+        finally:
+            writer.close()
+            await writer.wait_closed()
     finally:
         await server.shutdown()
 

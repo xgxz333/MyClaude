@@ -37,6 +37,7 @@ from my_claude.core.bus.command import AGENT_RUN_METHOD, EVENT_SUBSCRIBE_METHOD,
 from my_claude.core.bus.envelope import JsonRpcRequest
 from my_claude.core.config import AppConfig, load_config
 from my_claude.core.context import (
+    BASE_SYSTEM_PROMPT,
     AnthropicMessage,
     ExecutionContext,
     ExecutionMode,
@@ -510,6 +511,29 @@ def test_config_accepts_anthropic_env_aliases(
     assert os.environ["ANTHROPIC_BASE_URL"] == "https://ai.prism.uno"
 
 
+def test_config_loads_compaction_auto_threshold(tmp_path: Path) -> None:
+    config_file = tmp_path / "myclaude.toml"
+    config_file.write_text(
+        "\n".join(
+            [
+                "[compaction]",
+                "auto_threshold = 0.80",
+                "tool_result_limit = 12000",
+                "tool_result_keep = 6000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    default_config = load_config(config_file=tmp_path / "missing.toml", env_file=tmp_path / ".env")
+    config = load_config(config_file=config_file, env_file=tmp_path / ".env")
+
+    assert default_config.compaction.auto_threshold == 0.0
+    assert config.compaction.auto_threshold == 0.80
+    assert config.compaction.tool_result_limit == 12000
+    assert config.compaction.tool_result_keep == 6000
+
+
 def test_anthropic_provider_normalizes_base_url_to_messages_endpoint() -> None:
     assert _anthropic_messages_url("https://ai.prism.uno/v1") == (
         "https://ai.prism.uno/v1/messages"
@@ -603,11 +627,62 @@ def test_prepare_run_context_accepts_session_execution_context(tmp_path: Path) -
     assert context.run_id == "run-session"
     assert context.working_memory.goal == "latest question"
     assert context.working_memory.system_prompt_patch is not None
-    assert context.working_memory.system_prompt_patch.startswith("## Session Notes")
+    assert context.working_memory.system_prompt_patch.startswith(BASE_SYSTEM_PROMPT)
+    assert "## Session Notes" in context.working_memory.system_prompt_patch
     assert "decision: use busy errors" in context.working_memory.system_prompt_patch
     assert context.working_memory.messages[0].text == "earlier question"
     assert context.working_memory.messages[-1].text == "latest question"
     assert [definition.name for definition in context.tools.definitions()][-1] == "note_save"
+
+
+def test_prepare_run_context_injects_context_files_into_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    (home / ".myclaude").mkdir(parents=True)
+    (project / ".myclaude").mkdir(parents=True)
+    (home / ".myclaude" / "context.md").write_text(
+        "\n  global rule  \n",
+        encoding="utf-8",
+    )
+    (project / ".myclaude" / "context.md").write_text(
+        "\nproject rule\n\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+
+    execution_context = ExecutionContext(
+        mode=ExecutionMode.SESSION,
+        run_id="run-with-context",
+        goal="latest question",
+        session_id="sess-ctx",
+        episodic_messages=[AnthropicMessage.user_text("latest question")],
+        semantic_memory=[
+            SemanticMemoryItem(
+                kind=SemanticMemoryKind.FACT,
+                content="session fact",
+            )
+        ],
+    )
+
+    context = prepare_run_context(
+        "ignored",
+        config=AppConfig(runs_dir=tmp_path / "runs"),
+        execution_context=execution_context,
+    )
+
+    prompt = context.working_memory.system_prompt_patch
+    assert prompt is not None
+    assert context.working_memory.messages == [AnthropicMessage.user_text("latest question")]
+    assert prompt.index(BASE_SYSTEM_PROMPT) < prompt.index("## Global Context")
+    assert prompt.index("## Global Context") < prompt.index("## Project Context")
+    assert prompt.index("## Project Context") < prompt.index("## Session Notes")
+    assert "global rule" in prompt
+    assert "project rule" in prompt
+    assert "fact: session fact" in prompt
 
 
 def test_runner_writes_timeline_file(tmp_path: Path) -> None:

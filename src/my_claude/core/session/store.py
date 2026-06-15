@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from my_claude.core.context import SemanticMemoryKind
 
+TOOL_RESULT_LIMIT = 8_000
+TOOL_RESULT_KEEP = 4_000
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -123,7 +126,12 @@ class SessionStore:
         session.turns = self.read_messages(session.session_id)
         return session
 
-    def read_messages(self, session_id: str) -> list[SessionTurn]:
+    def read_messages(
+        self,
+        session_id: str,
+        *,
+        truncate_tools: bool = True,
+    ) -> list[SessionTurn]:
         """Read and validate the full persisted conversation timeline."""
 
         thread_path = self.thread_path_for(session_id)
@@ -163,7 +171,10 @@ class SessionStore:
                     created_at=str(row.get("ts") or row.get("created_at") or _now()),
                 )
             )
-        return _trim_orphan_tool_use(turns)
+        messages = _trim_orphan_tool_use(turns)
+        if not truncate_tools:
+            return messages
+        return truncate_tool_results(messages)
 
     def append_messages(
         self,
@@ -176,6 +187,23 @@ class SessionStore:
             session.turns.extend(messages)
             session.updated_at = _now()
         return self.write_meta(session)
+
+    def write_compacted(
+        self,
+        session_id: str,
+        compacted_messages: list[SessionTurn],
+    ) -> tuple[Path, Path]:
+        """Backup and replace a session thread with compacted messages."""
+
+        thread_path = self.thread_path_for(session_id)
+        if not thread_path.exists():
+            raise ValueError(f"session thread does not exist: {session_id}")
+
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        backup_path = self.session_dir(session_id) / f"thread_{timestamp}.jsonl.bak"
+        thread_path.rename(backup_path)
+        self._write_thread(session_id, compacted_messages)
+        return thread_path, backup_path
 
     def append_note(
         self,
@@ -292,6 +320,71 @@ def _session_from_meta_dict(data: dict[str, Any]) -> Session:
             if isinstance(note, dict)
         ],
     )
+
+
+def truncate_tool_results(
+    messages: list[Any],
+    limit: int = TOOL_RESULT_LIMIT,
+    keep: int = TOOL_RESULT_KEEP,
+) -> list[Any]:
+    """Return copies with oversized tool_result text shortened for LLM input only."""
+
+    result: list[Any] = []
+    for message in messages:
+        content = (
+            message.content
+            if isinstance(message, SessionTurn)
+            else message.get("content")
+            if isinstance(message, dict)
+            else None
+        )
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+
+        new_blocks, changed = _truncate_tool_result_blocks(
+            content,
+            limit=limit,
+            keep=keep,
+        )
+
+        if not changed:
+            result.append(message)
+        elif isinstance(message, SessionTurn):
+            result.append(message.model_copy(update={"content": new_blocks}))
+        elif isinstance(message, dict):
+            result.append({**message, "content": new_blocks})
+        else:
+            result.append(message)
+
+    return result
+
+
+def _truncate_tool_result_blocks(
+    blocks: list[dict[str, Any]],
+    *,
+    limit: int,
+    keep: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    new_blocks: list[dict[str, Any]] = []
+    changed = False
+    for block in blocks:
+        new_block = block
+        if (
+            block.get("type") == "tool_result"
+            and isinstance(block.get("content"), str)
+        ):
+            text = block["content"]
+            if len(text) > limit:
+                omitted = len(text) - keep
+                new_block = dict(block)
+                new_block["content"] = (
+                    text[:keep]
+                    + f"\n\n[... {omitted} chars omitted. Full output in run events.]"
+                )
+                changed = True
+        new_blocks.append(new_block)
+    return new_blocks, changed
 
 
 def _trim_orphan_tool_use(turns: list[SessionTurn]) -> list[SessionTurn]:

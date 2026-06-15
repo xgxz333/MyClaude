@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from my_claude.cli.commands.chat import _chat_async, _readline
+from my_claude.agent.events import RunFailedEvent
+from my_claude.cli.commands.chat import ChatEventRenderer, _chat_async, _readline
 from my_claude.cli.main import main
 from my_claude.core.app import register_routes
 from my_claude.core.bus.command import (
@@ -58,6 +59,28 @@ def test_readline_uses_injected_stream_without_blocking_stdin() -> None:
 
     assert line == "hello"
     assert output.getvalue() == "you> "
+
+
+def test_chat_renderer_terminates_on_run_failed_with_run_id() -> None:
+    output = io.StringIO()
+    errors = io.StringIO()
+    renderer = ChatEventRenderer(stream=output, error_stream=errors)
+
+    async def render_failed() -> int:
+        await renderer.start_run("run-1")
+        await renderer.handle_event_payload(
+            RunFailedEvent(
+                run_id="run-1",
+                error="exceeded_max_steps",
+            ).model_dump(mode="json")
+        )
+        return await renderer.wait_for_turn()
+
+    exit_code = asyncio.run(render_failed())
+
+    assert exit_code == 1
+    assert output.getvalue() == ""
+    assert errors.getvalue() == "[chat] run failed: exceeded_max_steps\n"
 
 
 async def _run_chat_via_test_daemon(tmp_path: Path) -> tuple[int, str, str, list[str]]:

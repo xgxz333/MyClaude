@@ -27,6 +27,17 @@ EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 class SocketClientError(RuntimeError):
     """Raised when the socket client cannot complete a request."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        data: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
 
 class SocketFrameDispatcher:
     """Demultiplex one socket byte stream into responses and pushed notifications."""
@@ -85,8 +96,15 @@ class SocketFrameDispatcher:
             return
 
         if isinstance(response, JsonRpcErrorResponse):
+            message = response.error.message
+            if response.error.data is not None:
+                message = f"{message}: {response.error.data}"
             response_future.set_exception(
-                SocketClientError(f"{response.error.message}: {response.error.data}")
+                SocketClientError(
+                    message,
+                    code=response.error.code,
+                    data=response.error.data,
+                )
             )
             return
 

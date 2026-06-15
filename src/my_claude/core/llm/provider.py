@@ -19,21 +19,18 @@ from my_claude.agent.events import (
 )
 from my_claude.agent.tools import ToolDefinition
 from my_claude.core.context import (
+    BASE_SYSTEM_PROMPT,
     AnthropicMessage,
     MessageContentBlock,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
-from my_claude.llm.client import LLMResponse
+from my_claude.llm.client import LLMResponse, LLMUsage
 
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_PROMPT_CACHING_BETA = "prompt-caching-2024-07-31"
-SYSTEM_PROMPT = (
-    "You are a helpful AI assistant. "
-    "Use the available tools to complete the user's goal. "
-    "When the goal is fully achieved, respond with a final answer and do not call any more tools."
-)
+DEFAULT_CONTEXT_WINDOW = 200_000
 
 
 @dataclass(frozen=True)
@@ -104,6 +101,7 @@ class AnthropicStreamingProvider:
         return _response_from_final_message(
             final_message,
             fallback_text="".join(text_parts),
+            model=self._config.model,
         )
 
     async def _emit_model_selected(self) -> None:
@@ -130,18 +128,25 @@ class AnthropicStreamingProvider:
         if usage is None:
             return
 
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cache_read_input_tokens = int(
+            getattr(usage, "cache_read_input_tokens", 0) or 0
+        )
+        cache_creation_input_tokens = int(
+            getattr(usage, "cache_creation_input_tokens", 0) or 0
+        )
+        context_pct = input_tokens / _context_window(self._config.model)
+
         await dispatch_event(
             self._event_handler,
             LLMUsageEvent(
                 run_id=self._run_id,
-                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
-                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
-                cache_read_input_tokens=int(
-                    getattr(usage, "cache_read_input_tokens", 0) or 0
-                ),
-                cache_creation_input_tokens=int(
-                    getattr(usage, "cache_creation_input_tokens", 0) or 0
-                ),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                context_pct=context_pct,
             ),
         )
 
@@ -252,23 +257,22 @@ def _messages_payload(messages: Sequence[AnthropicMessage]) -> list[dict[str, An
     ]
 
 
+def _context_window(model: str) -> int:
+    normalized = model.lower()
+    if normalized.startswith("claude-"):
+        return 200_000
+    return DEFAULT_CONTEXT_WINDOW
+
+
 def _system_payload(system_prompt_patch: str | None = None) -> list[dict[str, Any]]:
-    system_blocks: list[dict[str, Any]] = [
+    system_prompt = (system_prompt_patch or "").strip() or BASE_SYSTEM_PROMPT
+    return [
         {
             "type": "text",
-            "text": SYSTEM_PROMPT,
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
         }
     ]
-    patch = (system_prompt_patch or "").strip()
-    if patch:
-        system_blocks.append(
-            {
-                "type": "text",
-                "text": patch,
-            }
-        )
-    system_blocks[-1]["cache_control"] = {"type": "ephemeral"}
-    return system_blocks
 
 
 def _message_content_payload(message: AnthropicMessage) -> str | list[dict[str, Any]]:
@@ -287,7 +291,12 @@ def _anthropic_sdk_base_url(base_url: str) -> str:
     return stripped
 
 
-def _response_from_final_message(final_message: Any, *, fallback_text: str) -> LLMResponse:
+def _response_from_final_message(
+    final_message: Any,
+    *,
+    fallback_text: str,
+    model: str,
+) -> LLMResponse:
     content_blocks = tuple(
         block
         for raw_block in getattr(final_message, "content", ())
@@ -301,7 +310,31 @@ def _response_from_final_message(final_message: Any, *, fallback_text: str) -> L
         content=content,
         content_blocks=content_blocks,
         raw={"message": _raw_final_message(final_message)},
+        stop_reason=_stop_reason_from_final_message(final_message),
+        usage=_usage_from_final_message(final_message, model=model),
     )
+
+
+def _usage_from_final_message(final_message: Any, *, model: str) -> LLMUsage | None:
+    usage = getattr(final_message, "usage", None)
+    if usage is None:
+        return None
+
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    return LLMUsage(
+        input_tokens=input_tokens,
+        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+        cache_read_input_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        cache_creation_input_tokens=int(
+            getattr(usage, "cache_creation_input_tokens", 0) or 0
+        ),
+        context_pct=input_tokens / _context_window(model),
+    )
+
+
+def _stop_reason_from_final_message(final_message: Any) -> str | None:
+    value = getattr(final_message, "stop_reason", None)
+    return value if isinstance(value, str) else None
 
 
 def _content_block_from_anthropic_block(block: Any) -> MessageContentBlock | None:

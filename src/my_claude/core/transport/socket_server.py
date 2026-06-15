@@ -12,7 +12,12 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
-from my_claude.core.bus.command import BusResult, command_from_request, result_to_json
+from my_claude.core.bus.command import (
+    BusResult,
+    HandlerError,
+    command_from_request,
+    result_to_json,
+)
 from my_claude.core.bus.envelope import (
     EventPushEnvelope,
     JsonRpcErrorCode,
@@ -304,6 +309,12 @@ class TCPServer:
                 JsonRpcErrorCode.INVALID_PARAMS,
                 str(error),
             )
+        except HandlerError as error:
+            return make_error_response(
+                request_id,
+                error.code,
+                error.message,
+            )
         except Exception as error:
             self.logger.exception("request dispatch failed")
             return make_error_response(
@@ -372,4 +383,3 @@ def _client_identity(peer: Any) -> str:
             return str(peer[0])
 
     return str(peer)
-

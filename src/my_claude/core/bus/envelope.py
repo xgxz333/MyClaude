@@ -119,13 +119,19 @@ def make_notification(
 
 def make_error_response(
     request_id: JsonRpcId,
-    code: JsonRpcErrorCode,
+    code: JsonRpcErrorCode | int,
     message: str | None = None,
     data: Any | None = None,
 ) -> JsonRpcErrorResponse:
+    code_value = code.value if isinstance(code, JsonRpcErrorCode) else code
+    default_message = (
+        _default_error_message(code)
+        if isinstance(code, JsonRpcErrorCode)
+        else "Server error"
+    )
     error = JsonRpcError(
-        code=code.value,
-        message=message or _default_error_message(code),
+        code=code_value,
+        message=message or default_message,
         data=data,
     )
     return JsonRpcErrorResponse(id=request_id, error=error)

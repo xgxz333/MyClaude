@@ -18,6 +18,7 @@ SESSION_CREATE_METHOD: Literal["session.create"] = "session.create"
 SESSION_MESSAGE_METHOD: Literal["session.message"] = "session.message"
 SESSION_SEND_MESSAGE_METHOD: Literal["session.send_message"] = "session.send_message"
 SESSION_GET_HISTORY_METHOD: Literal["session.get_history"] = "session.get_history"
+SESSION_COMPACT_METHOD: Literal["session.compact"] = "session.compact"
 SESSION_CLOSE_METHOD: Literal["session.close"] = "session.close"
 PERMISSION_RESPOND_METHOD: Literal["permission.respond"] = "permission.respond"
 PACKAGE_NAME = "MyClaude"
@@ -218,6 +219,33 @@ class SessionGetHistoryResult(BaseModel):
     messages: list[dict[str, Any]]
 
 
+class SessionCompactParams(BaseModel):
+    """Parameters for manually compacting a session thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    focus: str = ""
+
+
+class SessionCompactCommand(BaseModel):
+    """Command envelope for manually compacting a session thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["session.compact"] = SESSION_COMPACT_METHOD
+    params: SessionCompactParams
+
+
+class SessionCompactResult(BaseModel):
+    """Result returned after compacting a session thread."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary_tokens: int
+    saved_tokens: int
+
+
 class SessionCloseParams(BaseModel):
     """Parameters for closing a session."""
 
@@ -261,6 +289,15 @@ class PermissionRespondResult(BaseModel):
     ok: bool = True
 
 
+class HandlerError(Exception):
+    """JSON-RPC handler error with an explicit application error code."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 BusCommand = (
     CorePingCommand
     | EventSubscribeCommand
@@ -269,6 +306,7 @@ BusCommand = (
     | SessionMessageCommand
     | SessionSendMessageCommand
     | SessionGetHistoryCommand
+    | SessionCompactCommand
     | SessionCloseCommand
     | PermissionRespondCommand
 )
@@ -280,6 +318,7 @@ BusResult = (
     | SessionMessageResult
     | SessionSendMessageResult
     | SessionGetHistoryResult
+    | SessionCompactResult
     | SessionCloseResult
     | PermissionRespondResult
 )
@@ -294,6 +333,7 @@ def command_from_request(request: JsonRpcRequest) -> BusCommand:
         SESSION_MESSAGE_METHOD,
         SESSION_SEND_MESSAGE_METHOD,
         SESSION_GET_HISTORY_METHOD,
+        SESSION_COMPACT_METHOD,
         SESSION_CLOSE_METHOD,
         PERMISSION_RESPOND_METHOD,
     }:
@@ -316,6 +356,8 @@ def command_from_request(request: JsonRpcRequest) -> BusCommand:
         return SessionSendMessageCommand.model_validate(payload)
     if request.method == SESSION_GET_HISTORY_METHOD:
         return SessionGetHistoryCommand.model_validate(payload)
+    if request.method == SESSION_COMPACT_METHOD:
+        return SessionCompactCommand.model_validate(payload)
     if request.method == SESSION_CLOSE_METHOD:
         return SessionCloseCommand.model_validate(payload)
     if request.method == PERMISSION_RESPOND_METHOD:

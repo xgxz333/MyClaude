@@ -5,6 +5,7 @@ from __future__ import annotations
 from my_claude.core.bus.events import (
     AgentEvent,
     AgentEventType,
+    ContextCompactedEvent,
     EventHandler,
     KnownAgentEvent,
     KnownAgentEventAdapter,
@@ -36,6 +37,7 @@ from my_claude.core.bus.events import (
 __all__ = [
     "AgentEvent",
     "AgentEventType",
+    "ContextCompactedEvent",
     "EventHandler",
     "KnownAgentEvent",
     "KnownAgentEventAdapter",

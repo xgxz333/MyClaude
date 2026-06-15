@@ -12,7 +12,7 @@ from my_claude.agent.events import AgentEvent, AgentEventType
 from my_claude.agent.tools import Tool, ToolDefinition, ToolRegistry, ToolResult
 from my_claude.core.context import AnthropicMessage, RunStatus, ToolUseBlock, WorkingMemory
 from my_claude.core.loop import AgentLoop
-from my_claude.llm.client import LLMResponse
+from my_claude.llm.client import LLMClient, LLMResponse, LLMUsage
 
 
 class ScriptedLLMClient:
@@ -35,6 +35,14 @@ class ScriptedLLMClient:
         if not self._responses:
             raise RuntimeError("no scripted llm response left")
         return self._responses.pop(0)
+
+
+class RecordingCompactor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[WorkingMemory, LLMClient]] = []
+
+    async def compact(self, context: WorkingMemory, provider: LLMClient) -> None:
+        self.calls.append((context, provider))
 
 
 def test_react_loop_observes_tool_calls_acts_then_terminates() -> None:
@@ -105,6 +113,156 @@ def test_react_loop_observes_tool_calls_acts_then_terminates() -> None:
     assert events[0].data == {"run_id": "run-1", "step": 1}
 
 
+def test_react_loop_auto_compacts_after_tool_use_response_above_threshold() -> None:
+    compactor = RecordingCompactor()
+    client = ScriptedLLMClient(
+        [
+            LLMResponse(
+                content="I need the echo tool.",
+                content_blocks=(
+                    ToolUseBlock(id="tool-1", name="echo", input={"value": "ok"}),
+                ),
+                stop_reason="tool_use",
+                usage=LLMUsage(input_tokens=80, context_pct=0.8),
+            ),
+            LLMResponse(content="Task complete.", stop_reason="end_turn"),
+        ]
+    )
+
+    async def echo_tool(arguments: dict[str, Any]) -> str:
+        return f"echo:{arguments['value']}"
+
+    memory = WorkingMemory.from_goal("use the echo tool", run_id="run-1", max_steps=3)
+    loop = AgentLoop(
+        llm_client=client,
+        tools=ToolRegistry(
+            [
+                Tool(
+                    definition=ToolDefinition(name="echo", description="Echo a value."),
+                    handler=echo_tool,
+                )
+            ]
+        ),
+        working_memory=memory,
+        loop_controller=LoopController(max_iterations=3),
+        compactor=compactor,
+        compact_threshold=0.8,
+    )
+
+    asyncio.run(loop.run())
+
+    assert compactor.calls == [(memory, client)]
+
+
+def test_react_loop_auto_compact_ignores_high_watermark_without_compactor() -> None:
+    async def echo_tool(_arguments: dict[str, Any]) -> str:
+        return "echo:ok"
+
+    memory = WorkingMemory.from_goal("use the echo tool", run_id="run-1", max_steps=3)
+    loop = AgentLoop(
+        llm_client=ScriptedLLMClient(
+            [
+                LLMResponse(
+                    content="I need the echo tool.",
+                    content_blocks=(ToolUseBlock(id="tool-1", name="echo", input={}),),
+                    stop_reason="tool_use",
+                    usage=LLMUsage(input_tokens=90, context_pct=0.9),
+                ),
+                LLMResponse(content="Task complete.", stop_reason="end_turn"),
+            ]
+        ),
+        tools=ToolRegistry(
+            [
+                Tool(
+                    definition=ToolDefinition(name="echo", description="Echo a value."),
+                    handler=echo_tool,
+                )
+            ]
+        ),
+        working_memory=memory,
+        loop_controller=LoopController(max_iterations=3),
+        compact_threshold=0.8,
+    )
+
+    result = asyncio.run(loop.run())
+
+    assert result.final_response == "Task complete."
+    assert memory.status == RunStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("response", "threshold"),
+    [
+        (
+            LLMResponse(
+                content="I need the echo tool.",
+                content_blocks=(ToolUseBlock(id="tool-1", name="echo", input={}),),
+                stop_reason="tool_use",
+                usage=LLMUsage(input_tokens=80, context_pct=0.8),
+            ),
+            0.0,
+        ),
+        (
+            LLMResponse(
+                content="I need the echo tool.",
+                content_blocks=(ToolUseBlock(id="tool-1", name="echo", input={}),),
+                stop_reason="tool_use",
+                usage=LLMUsage(input_tokens=79, context_pct=0.79),
+            ),
+            0.8,
+        ),
+        (
+            LLMResponse(
+                content="Done.",
+                stop_reason="end_turn",
+                usage=LLMUsage(input_tokens=80, context_pct=0.8),
+            ),
+            0.8,
+        ),
+        (
+            LLMResponse(
+                content="I need the echo tool.",
+                content_blocks=(ToolUseBlock(id="tool-1", name="echo", input={}),),
+                stop_reason="tool_use",
+            ),
+            0.8,
+        ),
+    ],
+)
+def test_react_loop_auto_compact_stays_disabled_unless_all_conditions_match(
+    response: LLMResponse,
+    threshold: float,
+) -> None:
+    compactor = RecordingCompactor()
+
+    async def echo_tool(_arguments: dict[str, Any]) -> str:
+        return "echo:ok"
+
+    responses = [response]
+    if response.tool_uses():
+        responses.append(LLMResponse(content="Task complete.", stop_reason="end_turn"))
+
+    loop = AgentLoop(
+        llm_client=ScriptedLLMClient(responses),
+        tools=ToolRegistry(
+            [
+                Tool(
+                    definition=ToolDefinition(name="echo", description="Echo a value."),
+                    handler=echo_tool,
+                )
+            ]
+        ),
+        working_memory=WorkingMemory.from_goal("ship it", run_id="run-1", max_steps=3),
+        loop_controller=LoopController(max_iterations=3),
+        compactor=compactor,
+        compact_threshold=threshold,
+    )
+
+    asyncio.run(loop.run())
+
+    assert compactor.calls == []
+
+
 def test_react_loop_passes_system_prompt_patch_to_llm() -> None:
     client = ScriptedLLMClient([LLMResponse(content="done")])
     memory = WorkingMemory.from_goal("ship it", run_id="run-1", max_steps=1)
@@ -119,6 +277,57 @@ def test_react_loop_passes_system_prompt_patch_to_llm() -> None:
     asyncio.run(loop.run())
 
     assert client.system_prompt_patches == ["Long-term session notes:\n- fact: repo uses uv"]
+
+
+def test_react_loop_max_steps_fails_without_raising_and_includes_run_id() -> None:
+    events: list[AgentEvent] = []
+
+    async def handle(event: AgentEvent) -> None:
+        events.append(event)
+
+    async def echo_tool(arguments: dict[str, Any]) -> str:
+        return f"echo:{arguments['value']}"
+
+    memory = WorkingMemory.from_goal("use echo once", run_id="run-1", max_steps=1)
+    loop = AgentLoop(
+        llm_client=ScriptedLLMClient(
+            [
+                LLMResponse(
+                    content="",
+                    content_blocks=(
+                        ToolUseBlock(
+                            id="tool-1",
+                            name="echo",
+                            input={"value": "ok"},
+                        ),
+                    ),
+                    stop_reason="tool_use",
+                )
+            ]
+        ),
+        tools=ToolRegistry(
+            [
+                Tool(
+                    definition=ToolDefinition(name="echo", description="Echo a value."),
+                    handler=echo_tool,
+                )
+            ]
+        ),
+        working_memory=memory,
+        loop_controller=LoopController(max_iterations=1),
+        event_handler=handle,
+    )
+
+    result = asyncio.run(loop.run())
+
+    assert result.final_response == ""
+    assert memory.status == RunStatus.FAILED
+    assert memory.reason == "exceeded_max_steps"
+    failed_events = [
+        event for event in events if event.type == AgentEventType.RUN_FAILED
+    ]
+    assert len(failed_events) == 1
+    assert failed_events[0].data == {"error": "exceeded_max_steps", "run_id": "run-1"}
 
 
 def test_react_loop_marks_memory_cancelled_when_external_cancel_is_requested() -> None:

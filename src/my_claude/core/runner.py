@@ -22,10 +22,12 @@ from my_claude.agent.events import (
 )
 from my_claude.agent.memory import RunStatus, WorkingMemory
 from my_claude.agent.tools import ToolRegistry
+from my_claude.core.compaction import Compactor
 from my_claude.core.config import AppConfig
 from my_claude.core.context import AnthropicMessage, ExecutionContext
 from my_claude.core.events.bus import EventBus
 from my_claude.core.events.writer import JsonlEventWriter
+from my_claude.core.memory.loader import load_context_file
 from my_claude.core.permissions.manager import PermissionManager
 from my_claude.core.task.manager import TaskManager
 from my_claude.core.tools.base import BaseTool
@@ -58,6 +60,7 @@ class RunContext:
     timeline_path: Path
     trace_path: Path
     config: AppConfig
+    session_id: str | None
     event_bus: EventBus[AgentEvent]
     working_memory: WorkingMemory
     tools: ToolRegistry
@@ -108,7 +111,15 @@ class AgentRunner:
         *,
         run_id: str | None = None,
     ) -> RunOutcome:
-        context = prepare_run_context(goal, config=self._config, run_id=run_id)
+        global_ctx = load_context_file(Path("~/.myclaude/context.md"))
+        project_ctx = load_context_file(Path(".myclaude/context.md"))
+        context = prepare_run_context(
+            goal,
+            config=self._config,
+            run_id=run_id,
+            global_context=global_ctx,
+            project_context=project_ctx,
+        )
         result = await run_prepared_context(
             context,
             listeners=self._listeners,
@@ -202,12 +213,35 @@ def prepare_run_context(
     run_id: str | None = None,
     execution_context: ExecutionContext | None = None,
     permission_manager: PermissionManager | None = None,
+    global_context: str | None = None,
+    project_context: str | None = None,
 ) -> RunContext:
+    global_ctx = (
+        load_context_file(Path("~/.myclaude/context.md"))
+        if global_context is None
+        else global_context
+    )
+    project_ctx = (
+        load_context_file(Path(".myclaude/context.md"))
+        if project_context is None
+        else project_context
+    )
     if execution_context is not None:
         run_id = execution_context.run_id
+        execution_context = execution_context.model_copy(
+            update={
+                "global_context": global_ctx,
+                "project_context": project_ctx,
+            }
+        )
     else:
         run_id = run_id or new_run_id()
-        execution_context = ExecutionContext.isolated(goal=goal, run_id=run_id)
+        execution_context = ExecutionContext.isolated(
+            goal=goal,
+            run_id=run_id,
+            global_context=global_ctx,
+            project_context=project_ctx,
+        )
     run_dir = _run_dir_for_execution_context(config, execution_context)
     run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -242,6 +276,7 @@ def prepare_run_context(
         timeline_path=timeline_path,
         trace_path=trace_path,
         config=config,
+        session_id=execution_context.session_id,
         event_bus=event_bus,
         working_memory=working_memory,
         tools=tools,
@@ -329,12 +364,29 @@ def _create_agent(context: RunContext, *, trace_writer: TraceWriter | None) -> A
             include_payload=context.config.trace_include_llm_payload,
             run_id=context.run_id,
         )
+    session_dir = (
+        context.config.runs_dir / "sessions" / context.session_id
+        if context.session_id is not None
+        else context.run_dir
+    )
+    compactor = Compactor(
+        context.event_bus,
+        session_dir,
+        context.session_id or "",
+        llm_client_factory=lambda: create_llm_client(
+            context.config,
+            event_handler=None,
+            run_id="compact",
+        ),
+    )
     return Agent(
         llm_client=llm_client,
         tools=context.tools,
         working_memory=context.working_memory,
         loop_controller=context.loop_controller,
         event_handler=context.event_bus.publish,
+        compactor=compactor,
+        compact_threshold=context.config.compaction.auto_threshold,
     )
 
 
@@ -346,7 +398,10 @@ async def _handle_run_interruption(context: RunContext) -> None:
             transition_reason="runner caught cancellation or interruption",
         )
         await context.event_bus.publish(
-            RunCancelledEvent(reason=context.working_memory.status_transition_reason)
+            RunCancelledEvent(
+                run_id=context.run_id,
+                reason=context.working_memory.status_transition_reason,
+            )
         )
 
     logger.info(

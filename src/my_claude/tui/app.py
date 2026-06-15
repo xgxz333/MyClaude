@@ -23,6 +23,7 @@ from my_claude.core.bus.command import (
     EVENT_SUBSCRIBE_METHOD,
     PERMISSION_RESPOND_METHOD,
     SESSION_CLOSE_METHOD,
+    SESSION_COMPACT_METHOD,
     SESSION_CREATE_METHOD,
     SESSION_SEND_MESSAGE_METHOD,
 )
@@ -48,6 +49,7 @@ RUN_SCOPED_EVENT_TYPES = {
     AgentEventType.RUN_CANCELLED.value,
     AgentEventType.RUN_FAILED.value,
 }
+TUI_EVENT_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 class LLMStreamBlock(Static):
@@ -312,6 +314,7 @@ class MyClaudeTui(App[None]):
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._pending_permission_selects: dict[str, PermissionSelect] = {}
+        self._last_context_pct = 0.0
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]MyClaude[/bold]  [dim]connecting...[/dim]", id="header")
@@ -408,6 +411,16 @@ class MyClaudeTui(App[None]):
             self._append_log("WARNING", "tui", f"session is busy: {self._active_run_id}")
             return
 
+        if message == "/compact":
+            message_input.value = ""
+            self.run_worker(
+                self._do_compact(),
+                name="compact",
+                exclusive=False,
+                exit_on_error=False,
+            )
+            return
+
         self._awaiting_message_result = True
         message_input.value = ""
         self._append(Static(f"[bold]you[/bold]  {message}", classes="user-message"))
@@ -445,6 +458,42 @@ class MyClaudeTui(App[None]):
         self._awaiting_message_result = False
         self._mark_turn_running(str(result["run_id"]))
 
+    async def _do_compact(self) -> None:
+        client = self._client
+        if client is None or not client.is_connected or self._session_id is None:
+            self._append_log("ERROR", "tui", "daemon is not connected")
+            return
+
+        self._append(Static("[dim]⚡ compacting context...[/dim]", classes="log-line"))
+        try:
+            result = await client.request(
+                SESSION_COMPACT_METHOD,
+                {"session_id": self._session_id, "focus": ""},
+                timeout_seconds=max(
+                    self._config.ipc_timeout_seconds,
+                    self._config.llm_timeout_seconds,
+                ),
+            )
+        except SocketClientError as error:
+            self._append(
+                Static(
+                    f"[red]compact error:[/red] {_compact_error_message(error)}",
+                    classes="log-line",
+                )
+            )
+            return
+
+        summary_tokens = result.get("summary_tokens", 0)
+        saved_tokens = result.get("saved_tokens", 0)
+        self._last_context_pct = 0.0
+        self._append(
+            Static(
+                f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                classes="log-line",
+            )
+        )
+
     async def _network_loop(self) -> None:
         retry_seconds = 1.0
         header = self.query_one("#header", Label)
@@ -457,30 +506,38 @@ class MyClaudeTui(App[None]):
                     self._config.core_host,
                     self._config.core_port,
                     timeout_seconds=self._config.ipc_timeout_seconds,
-                    max_response_bytes=self._config.max_request_bytes,
+                    max_response_bytes=max(
+                        self._config.max_request_bytes,
+                        TUI_EVENT_RESPONSE_BYTES,
+                    ),
                 )
                 await client.connect()
                 client.on_event(self._handle_event)
 
+                subscribe_params: dict[str, Any] = {
+                    "topics": [
+                        "session.*",
+                        "permission.*",
+                        "run.*",
+                        "step.*",
+                        "tool.*",
+                        "llm.token",
+                        "llm.usage",
+                        "llm.response_completed",
+                        "context.*",
+                        "log.*",
+                    ],
+                    "scope": "global",
+                }
+                if self._active_run_id is not None:
+                    subscribe_params["replay_from_run"] = self._active_run_id
                 await client.request(
                     EVENT_SUBSCRIBE_METHOD,
-                    {
-                        "topics": [
-                            "session.*",
-                            "permission.*",
-                            "run.*",
-                            "step.*",
-                            "tool.*",
-                            "llm.token",
-                            "llm.usage",
-                            "llm.response_completed",
-                            "log.*",
-                        ],
-                        "scope": "global",
-                    },
+                    subscribe_params,
                 )
-                session_result = await client.request(SESSION_CREATE_METHOD, {})
-                self._session_id = str(session_result["session_id"])
+                if self._session_id is None:
+                    session_result = await client.request(SESSION_CREATE_METHOD, {})
+                    self._session_id = str(session_result["session_id"])
 
                 self._client = client
                 self._connected.set()
@@ -490,7 +547,10 @@ class MyClaudeTui(App[None]):
                     f"[dim]{self._config.core_host}:{self._config.core_port}[/dim]  "
                     f"[dim]{self._session_id}[/dim]"
                 )
-                self._mark_turn_waiting()
+                if self._active_run_id is not None:
+                    self._mark_turn_running(self._active_run_id)
+                else:
+                    self._mark_turn_waiting()
 
                 await client.wait_closed()
             except asyncio.CancelledError:
@@ -509,9 +569,6 @@ class MyClaudeTui(App[None]):
                 if self._client is client:
                     self._client = None
                 self._connected.clear()
-                self._session_id = None
-                self._active_run_id = None
-                self._awaiting_message_result = False
                 self._pending_events_by_run.clear()
                 self._break_llm()
                 self._set_waiting_for_connection()
@@ -690,13 +747,29 @@ class MyClaudeTui(App[None]):
             self._finish_active_turn_if_matching(event)
 
         elif event_type == AgentEventType.LLM_USAGE:
+            pct = _safe_float(event.get("context_pct"))
+            self._last_context_pct = pct
+            ctx_bar = self._render_ctx_bar(pct)
             self._append(
                 Static(
                     f"[dim]  tokens  "
                     f"in={event.get('input_tokens')} "
                     f"out={event.get('output_tokens')} "
-                    f"cache={event.get('cache_read_input_tokens')}[/dim]",
+                    f"cache={event.get('cache_read_input_tokens')}[/dim]"
+                    f"  {ctx_bar}",
                     classes="usage",
+                )
+            )
+
+        elif event_type == AgentEventType.CONTEXT_COMPACTED:
+            original = event.get("original_tokens", 0)
+            summary = event.get("summary_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(
+                Static(
+                    f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                    f"  [dim]original≈{original} tokens → summary={summary} tokens[/dim]",
+                    classes="log-line",
                 )
             )
 
@@ -713,6 +786,19 @@ class MyClaudeTui(App[None]):
             self.mount(select, before="#command-bar")
         except Exception:
             self._append(select)
+
+    def _render_ctx_bar(self, pct: float) -> str:
+        clamped = min(max(pct, 0.0), 1.0)
+        filled = int(clamped * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        label = f"ctx:{clamped * 100:.1f}%"
+        if clamped >= 0.85:
+            color = "bold red"
+        elif clamped >= 0.70:
+            color = "yellow"
+        else:
+            color = "dim"
+        return f"[{color}]{label} {bar}[/{color}]"
 
     def _respond_permission(self, tool_use_id: str, decision: str) -> None:
         self._resolve_permission(tool_use_id, decision)
@@ -788,7 +874,7 @@ class MyClaudeTui(App[None]):
 
     def _should_render_event(self, event: Mapping[str, Any]) -> bool:
         event_type = str(event.get("type", ""))
-        if event_type == "log.line":
+        if event_type in {"log.line", AgentEventType.CONTEXT_COMPACTED.value}:
             return True
         if event_type not in RUN_SCOPED_EVENT_TYPES:
             return False
@@ -839,6 +925,21 @@ def _run_id_from(event: Mapping[str, Any]) -> str | None:
 
 def _int_from(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compact_error_message(error: SocketClientError) -> str:
+    if error.code == -32021:
+        return "nothing to compact yet; send a message and wait for it to finish first"
+    if error.code == -32020:
+        return "LLM provider is not available for compaction"
+    return str(error)
 
 
 def _preview(value: str, limit: int) -> str:

@@ -7,6 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+BASE_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant. "
+    "Use the available tools to complete the user's goal. "
+    "When the goal is fully achieved, respond with a final answer and do not call any more tools."
+)
+
 
 class RunStatus(StrEnum):
     """High-level lifecycle status tracked by working memory."""
@@ -112,10 +118,25 @@ class ExecutionContext(BaseModel):
     session_id: str | None = None
     episodic_messages: list[AnthropicMessage] = Field(default_factory=list)
     semantic_memory: list[SemanticMemoryItem] = Field(default_factory=list)
+    global_context: str = ""
+    project_context: str = ""
 
     @classmethod
-    def isolated(cls, *, goal: str, run_id: str) -> ExecutionContext:
-        return cls(mode=ExecutionMode.ISOLATED, run_id=run_id, goal=goal)
+    def isolated(
+        cls,
+        *,
+        goal: str,
+        run_id: str,
+        global_context: str = "",
+        project_context: str = "",
+    ) -> ExecutionContext:
+        return cls(
+            mode=ExecutionMode.ISOLATED,
+            run_id=run_id,
+            goal=goal,
+            global_context=global_context,
+            project_context=project_context,
+        )
 
     def llm_messages(self) -> list[AnthropicMessage]:
         if self.mode == ExecutionMode.ISOLATED:
@@ -126,9 +147,19 @@ class ExecutionContext(BaseModel):
             messages.append(AnthropicMessage.user_text(self.goal))
         return messages
 
-    def system_prompt_patch(self) -> str | None:
+    def system_prompt(self, base: str = BASE_SYSTEM_PROMPT) -> str:
+        parts = [base]
+        if self.global_context.strip():
+            parts.append("\n\n## Global Context\n" + self.global_context.strip())
+        if self.project_context.strip():
+            parts.append("\n\n## Project Context\n" + self.project_context.strip())
+        if session_notes := self.session_notes():
+            parts.append("\n\n" + session_notes)
+        return "".join(parts)
+
+    def session_notes(self) -> str:
         if not self.semantic_memory:
-            return None
+            return ""
 
         lines = ["## Session Notes"]
         for item in self.semantic_memory:
@@ -140,6 +171,10 @@ class ExecutionContext(BaseModel):
                 lines.append(f"- {label}: {content}")
         lines.extend(["", "Remember important durable facts by calling note_save."])
         return "\n".join(lines)
+
+    def system_prompt_patch(self) -> str | None:
+        session_notes = self.session_notes().strip()
+        return session_notes or None
 
 
 class WorkingMemory(BaseModel):
@@ -177,7 +212,7 @@ class WorkingMemory(BaseModel):
             run_id=execution_context.run_id,
             goal=execution_context.goal,
             max_steps=max_steps,
-            system_prompt_patch=execution_context.system_prompt_patch(),
+            system_prompt_patch=execution_context.system_prompt(),
             messages=execution_context.llm_messages(),
         )
 
@@ -206,6 +241,13 @@ class WorkingMemory(BaseModel):
 
     def llm_messages(self) -> list[AnthropicMessage]:
         return list(self.messages)
+
+    def is_done(self) -> bool:
+        return self.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED,
+        }
 
     def append_assistant_text(self, text: str) -> None:
         self.messages.append(AnthropicMessage.assistant_text(text))

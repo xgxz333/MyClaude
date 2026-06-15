@@ -6,6 +6,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from my_claude.agent.control import LoopController
 from my_claude.agent.events import (
@@ -29,6 +30,12 @@ from my_claude.llm.client import LLMClient, LLMResponse
 CancelRequested = Callable[[], bool]
 
 
+class Compactor(Protocol):
+    """Optional context compactor used by the agent loop."""
+
+    async def compact(self, context: WorkingMemory, provider: LLMClient) -> None: ...
+
+
 @dataclass(frozen=True)
 class AgentLoopResult:
     """Final result produced after the ReAct loop terminates."""
@@ -48,6 +55,8 @@ class AgentLoop:
         loop_controller: LoopController,
         event_handler: EventHandler | None = None,
         cancel_requested: CancelRequested | None = None,
+        compactor: Compactor | None = None,
+        compact_threshold: float = 0.0,
     ) -> None:
         self._llm_client = llm_client
         self._tools = tools
@@ -55,6 +64,8 @@ class AgentLoop:
         self._loop_controller = loop_controller
         self._event_handler = event_handler
         self._cancel_requested = cancel_requested
+        self._compactor = compactor
+        self._compact_threshold = compact_threshold
 
     async def run(self) -> AgentLoopResult:
         last_response = ""
@@ -79,19 +90,29 @@ class AgentLoop:
                     )
                 )
 
+                await self._maybe_auto_compact(response)
+
                 tool_uses = response.tool_uses()
                 if tool_uses:
                     await self._act(tool_uses)
                     self._raise_if_cancelled("cancelled after acting")
 
                     if not self._loop_controller.should_continue():
+                        reason = "exceeded_max_steps"
                         self._working_memory.set_status(
                             RunStatus.FAILED,
-                            reason="agent loop reached max_steps",
+                            reason=reason,
                             transition_reason="safety fuse triggered after tool calls",
                         )
                         await self._finish_step()
-                        raise RuntimeError("agent loop reached max_steps")
+                        await self._emit(
+                            RunFailedEvent(
+                                message=reason,
+                                error=reason,
+                                run_id=self._working_memory.run_id,
+                            )
+                        )
+                        return AgentLoopResult(final_response=last_response)
 
                     await self._finish_step()
                     continue
@@ -120,7 +141,13 @@ class AgentLoop:
                     reason=str(error),
                     transition_reason="agent loop raised an exception",
                 )
-            await self._emit(RunFailedEvent(message=str(error), error=str(error)))
+            await self._emit(
+                RunFailedEvent(
+                    message=str(error),
+                    error=str(error),
+                    run_id=self._working_memory.run_id,
+                )
+            )
             raise
 
     async def _plan(self) -> LLMResponse:
@@ -139,6 +166,17 @@ class AgentLoop:
             step=self._working_memory.step,
             system_prompt_patch=self._working_memory.system_prompt_patch,
         )
+
+    async def _maybe_auto_compact(self, response: LLMResponse) -> None:
+        if (
+            not self._working_memory.is_done()
+            and response.stop_reason == "tool_use"
+            and self._compactor is not None
+            and self._compact_threshold > 0
+            and response.usage is not None
+            and response.usage.context_pct >= self._compact_threshold
+        ):
+            await self._compactor.compact(self._working_memory, self._llm_client)
 
     async def _act(self, tool_uses: list[ToolUseBlock]) -> None:
         for tool_use in tool_uses:
@@ -212,7 +250,12 @@ class AgentLoop:
                 reason="agent run cancelled",
                 transition_reason=transition_reason,
             )
-        await self._emit(RunCancelledEvent(reason=self._working_memory.status_transition_reason))
+        await self._emit(
+            RunCancelledEvent(
+                run_id=self._working_memory.run_id,
+                reason=self._working_memory.status_transition_reason,
+            )
+        )
 
     async def _emit(self, event: AgentEvent) -> None:
         await dispatch_event(self._event_handler, event)

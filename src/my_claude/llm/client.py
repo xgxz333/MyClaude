@@ -22,12 +22,25 @@ ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 
 
 @dataclass(frozen=True)
+class LLMUsage:
+    """Token usage metadata returned by an LLM response."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    context_pct: float = 0.0
+
+
+@dataclass(frozen=True)
 class LLMResponse:
     """Text response returned by an LLM client, optionally with raw provider data."""
 
     content: str
     content_blocks: tuple[MessageContentBlock, ...] = ()
     raw: Mapping[str, Any] | None = None
+    stop_reason: str | None = None
+    usage: LLMUsage | None = None
 
     def assistant_message(self) -> AnthropicMessage:
         if self.content_blocks:

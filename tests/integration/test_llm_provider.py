@@ -10,11 +10,13 @@ from typing import Any, cast
 import pytest
 
 from my_claude.agent.tools import ToolDefinition
-from my_claude.core.context import AnthropicMessage
+from my_claude.core.bus.events import AgentEvent, LLMUsageEvent
+from my_claude.core.context import BASE_SYSTEM_PROMPT, AnthropicMessage
 from my_claude.core.llm.provider import (
     AnthropicProviderConfig,
     AnthropicStreamingProvider,
     _anthropic_sdk_base_url,
+    _context_window,
     _iter_sse_events,
     _messages_payload,
     _system_payload,
@@ -38,8 +40,8 @@ def test_provider_adds_cache_control_to_system_and_tool_anchors() -> None:
     )
 
     assert system[-1]["cache_control"] == {"type": "ephemeral"}
-    assert patched_system[0]["text"].startswith("You are a helpful AI assistant")
-    assert patched_system[1]["text"] == "Long-term session notes:\n- fact: repo uses uv"
+    assert system[0]["text"] == BASE_SYSTEM_PROMPT
+    assert patched_system[0]["text"] == "Long-term session notes:\n- fact: repo uses uv"
     assert patched_system[-1]["cache_control"] == {"type": "ephemeral"}
     assert messages[-1]["content"] == "ship it"
     assert tools[-1]["cache_control"] == {"type": "ephemeral"}
@@ -122,6 +124,51 @@ def test_provider_uses_anthropic_sdk_stream_and_parses_final_message() -> None:
     assert response.content == "Use the tool."
     assert len(response.content_blocks) == 2
     assert response.tool_uses()[0].input == {"value": "ok"}
+
+
+def test_provider_emits_usage_event_with_context_pct() -> None:
+    events: list[AgentEvent] = []
+
+    async def collect(event: AgentEvent) -> None:
+        events.append(event)
+
+    usage = SimpleNamespace(
+        input_tokens=20_000,
+        output_tokens=500,
+        cache_read_input_tokens=100,
+        cache_creation_input_tokens=200,
+    )
+    final_message = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="done")],
+        usage=usage,
+    )
+    provider = AnthropicStreamingProvider(
+        AnthropicProviderConfig(
+            api_key="test-key",
+            model="claude-sonnet-4-6",
+            base_url="https://ai.prism.uno/v1/messages",
+        ),
+        client=SimpleNamespace(
+            messages=FakeMessages(FakeStream(texts=["done"], final_message=final_message)),
+        ),
+        event_handler=collect,
+        run_id="run-usage",
+    )
+
+    response = asyncio.run(provider.complete([AnthropicMessage.user_text("ship it")], []))
+
+    usage_events = [event for event in events if isinstance(event, LLMUsageEvent)]
+    assert len(usage_events) == 1
+    event = usage_events[0]
+    assert event.run_id == "run-usage"
+    assert event.input_tokens == 20_000
+    assert event.output_tokens == 500
+    assert event.cache_read_input_tokens == 100
+    assert event.cache_creation_input_tokens == 200
+    assert event.context_pct == 20_000 / _context_window("claude-sonnet-4-6")
+    assert response.stop_reason is None
+    assert response.usage is not None
+    assert response.usage.context_pct == event.context_pct
 
 
 def test_provider_normalizes_streamed_text_and_tool_use_blocks() -> None:

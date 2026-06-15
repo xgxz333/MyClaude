@@ -92,6 +92,8 @@ class ChatEventRenderer:
                 print(f"[tool] {tool_name} done {elapsed_ms}ms", file=self._stream, flush=True)
         elif event.type == AgentEventType.RUN_COMPLETED:
             self._terminal_exit_code = 0
+        elif event.type == AgentEventType.SESSION_WAITING_FOR_INPUT:
+            self._terminal_exit_code = 0
             self._terminal_event.set()
         elif event.type == AgentEventType.RUN_CANCELLED:
             self._terminal_exit_code = 130
@@ -161,6 +163,7 @@ async def _chat_async(
             EVENT_SUBSCRIBE_METHOD,
             {
                 "topics": [
+                    "session.*",
                     "run.*",
                     "tool.*",
                     "llm.token",
@@ -251,6 +254,10 @@ def _arg_value(args: argparse.Namespace | None, name: str) -> Any:
 
 
 def _event_run_id(event: AgentEvent) -> str | None:
+    last_run_id = event.data.get("last_run_id")
+    if isinstance(last_run_id, str):
+        return last_run_id
+
     run_id = event.data.get("run_id")
     if isinstance(run_id, str):
         return run_id

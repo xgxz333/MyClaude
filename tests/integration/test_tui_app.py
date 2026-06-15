@@ -4,6 +4,7 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from my_claude.agent.events import (
+    ContextCompactedEvent,
     LLMResponseCompletedEvent,
     LLMTokenEvent,
     LLMUsageEvent,
@@ -14,6 +15,7 @@ from my_claude.agent.events import (
     ToolCallCompletedEvent,
     ToolCallStartedEvent,
 )
+from my_claude.core.transport.socket_client import SocketClientError
 from my_claude.tui.app import (
     LLMStreamBlock,
     MyClaudeTui,
@@ -73,6 +75,7 @@ def test_tui_renders_run_step_and_usage_like_kama() -> None:
             input_tokens=10,
             output_tokens=4,
             cache_read_input_tokens=1,
+            context_pct=0.63,
         )
     )
     app._write_event(RunCompletedEvent(goal="ship it", run_id="run-1", steps=2))
@@ -80,8 +83,51 @@ def test_tui_renders_run_step_and_usage_like_kama() -> None:
     assert app.static_texts == [
         "[bold cyan]▶ run[/bold cyan]  [dim]run-1[/dim]\n  [dim]goal:[/dim] ship it",
         "[dim]── step 2 ────────────────────────────────────────────────[/dim]",
-        "[dim]  tokens  in=10 out=4 cache=1[/dim]",
+        "[dim]  tokens  in=10 out=4 cache=1[/dim]  [dim]ctx:63.0% ████████████░░░░░░░░[/dim]",
         "[bold green]✓ completed[/bold green]  [dim]2 steps[/dim]",
+    ]
+    assert app._last_context_pct == 0.63
+
+
+def test_tui_handles_bad_context_pct_without_crashing() -> None:
+    app = RenderlessTui()
+    app._mark_turn_running("run-1")
+
+    app._receive_event_payload(
+        {
+            "type": "llm.usage",
+            "run_id": "run-1",
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "cache_read_input_tokens": 1,
+            "context_pct": "not-a-number",
+        }
+    )
+
+    assert app.static_texts == [
+        "[dim]  tokens  in=10 out=4 cache=1[/dim]  [dim]ctx:0.0% ░░░░░░░░░░░░░░░░░░░░[/dim]"
+    ]
+    assert app._last_context_pct == 0.0
+
+
+def test_tui_renders_context_compacted_event_and_resets_watermark() -> None:
+    app = RenderlessTui()
+    app._last_context_pct = 0.91
+
+    app._write_event(
+        ContextCompactedEvent(
+            session_id="sess-1",
+            run_id="run-1",
+            original_tokens=12,
+            summary_tokens=2,
+            ts="2026-06-15T00:00:00Z",
+        )
+    )
+
+    assert app._last_context_pct == 0.0
+    assert app.static_texts == [
+        "[bold cyan]⚡ Context compacted[/bold cyan]  "
+        "[dim]original≈12 tokens → summary=2 tokens[/dim]"
     ]
 
 
@@ -203,6 +249,56 @@ def test_tui_submit_message_schedules_background_worker() -> None:
     assert app.input_states[-1] == (True, "Sending...", "Busy")
 
 
+def test_tui_compact_command_schedules_compact_worker() -> None:
+    app = WorkerRecordingTui()
+    app._client = ConnectedClient()
+    app._session_id = "sess-1"
+    app.message_input.value = "/compact"
+
+    app._submit_message()
+
+    assert app.message_input.value == ""
+    assert app.worker_calls == [("compact", False)]
+    assert app.static_texts == []
+
+
+def test_tui_do_compact_renders_result() -> None:
+    app = RenderlessTui()
+    app._client = CompactClient()
+    app._session_id = "sess-1"
+    app._config = app._config.model_copy(
+        update={"ipc_timeout_seconds": 5.0, "llm_timeout_seconds": 120.0}
+    )
+
+    import asyncio
+
+    asyncio.run(app._do_compact())
+
+    assert app._last_context_pct == 0.0
+    assert app.static_texts == [
+        "[dim]⚡ compacting context...[/dim]",
+        "[bold cyan]⚡ Context compacted[/bold cyan]  "
+        "[dim]summary=12 tokens  saved≈34 tokens[/dim]",
+    ]
+    assert app._client.timeout_seconds == 120.0
+
+
+def test_tui_do_compact_renders_empty_history_error() -> None:
+    app = RenderlessTui()
+    app._client = CompactErrorClient(-32021, "compaction failed or not beneficial")
+    app._session_id = "sess-1"
+
+    import asyncio
+
+    asyncio.run(app._do_compact())
+
+    assert app.static_texts == [
+        "[dim]⚡ compacting context...[/dim]",
+        "[red]compact error:[/red] nothing to compact yet; "
+        "send a message and wait for it to finish first",
+    ]
+
+
 def test_tool_call_block_click_lazily_loads_details_and_toggles_state() -> None:
     block = ToolCallBlock(
         "write_file",
@@ -276,6 +372,43 @@ class ConnectedClient:
 
     async def request(self, _method: str, _params: dict[str, str]) -> dict[str, str]:
         raise AssertionError("request should run only inside the worker")
+
+
+class CompactClient:
+    is_connected = True
+    timeout_seconds: float | None = None
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, int]:
+        assert method == "session.compact"
+        assert params == {"session_id": "sess-1", "focus": ""}
+        self.timeout_seconds = timeout_seconds
+        return {"summary_tokens": 12, "saved_tokens": 34}
+
+
+class CompactErrorClient:
+    is_connected = True
+
+    def __init__(self, code: int, message: str) -> None:
+        self._code = code
+        self._message = message
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, int]:
+        del timeout_seconds
+        assert method == "session.compact"
+        assert params == {"session_id": "sess-1", "focus": ""}
+        raise SocketClientError(self._message, code=self._code)
 
 
 class WorkerRecordingTui(RenderlessTui):
